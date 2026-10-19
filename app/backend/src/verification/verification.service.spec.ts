@@ -1,5 +1,4 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { NotFoundException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { getQueueToken } from '@nestjs/bullmq';
 import { HttpService } from '@nestjs/axios';
@@ -19,6 +18,8 @@ jest.mock('../common/utils/correlation-propagation.util');
 describe('VerificationService', () => {
   let service: VerificationService;
   let prismaService: PrismaService;
+  let testingModules: TestingModule[] = [];
+  let originalRandom: () => number;
   let mockQueue: {
     add: jest.Mock;
     getWaiting: jest.Mock;
@@ -97,6 +98,8 @@ describe('VerificationService', () => {
 
   beforeEach(async () => {
     jest.clearAllMocks();
+    originalRandom = Math.random;
+    Math.random = () => 0.9;
 
     mockQueue = {
       add: jest.fn().mockResolvedValue({ id: 'job-123' }),
@@ -166,9 +169,16 @@ describe('VerificationService', () => {
         },
       ],
     }).compile();
+    testingModules.push(module);
 
     service = module.get<VerificationService>(VerificationService);
     prismaService = module.get<PrismaService>(PrismaService);
+  });
+
+  afterEach(async () => {
+    Math.random = originalRandom;
+    await Promise.all(testingModules.map(m => m?.close()));
+    testingModules = [];
   });
 
   it('should be defined', () => {
@@ -248,12 +258,15 @@ describe('VerificationService', () => {
       );
     });
 
-    it('should throw NotFoundException for non-existent claim', async () => {
+    it('should throw AppException(AI_VERIFICATION_FAILED) for non-existent claim', async () => {
       jest.spyOn(prismaService.claim, 'findUnique').mockResolvedValue(null);
 
       await expect(
         service.enqueueVerification('non-existent-id'),
-      ).rejects.toThrow(NotFoundException);
+      ).rejects.toMatchObject({
+        errorCode: 'AI_VERIFICATION_FAILED',
+        statusCode: 404,
+      });
     });
 
     it('should skip enqueuing for already verified claims', async () => {
@@ -298,7 +311,7 @@ describe('VerificationService', () => {
       expect(updateSpy).toHaveBeenCalled();
     });
 
-    it('should throw NotFoundException for non-existent claim during processing', async () => {
+    it('should throw AppException(AI_VERIFICATION_FAILED) for non-existent claim during processing', async () => {
       jest.spyOn(prismaService.claim, 'findUnique').mockResolvedValue(null);
 
       await expect(
@@ -307,7 +320,10 @@ describe('VerificationService', () => {
           timestamp: Date.now(),
           priority: VerificationPriority.NORMAL,
         }),
-      ).rejects.toThrow(NotFoundException);
+      ).rejects.toMatchObject({
+        errorCode: 'AI_VERIFICATION_FAILED',
+        statusCode: 404,
+      });
     });
 
     it('should update claim status to verified when score meets threshold', async () => {
@@ -405,6 +421,7 @@ describe('VerificationService', () => {
           },
         ],
       }).compile();
+      testingModules.push(module);
 
       service = module.get<VerificationService>(VerificationService);
       prismaService = module.get<PrismaService>(PrismaService);
@@ -573,12 +590,13 @@ describe('VerificationService', () => {
       expect(result).toEqual(mockClaim);
     });
 
-    it('should throw NotFoundException for non-existent claim', async () => {
+    it('should throw AppException(AI_VERIFICATION_FAILED) for non-existent claim', async () => {
       jest.spyOn(prismaService.claim, 'findUnique').mockResolvedValue(null);
 
-      await expect(service.findOne('non-existent-id')).rejects.toThrow(
-        NotFoundException,
-      );
+      await expect(service.findOne('non-existent-id')).rejects.toMatchObject({
+        errorCode: 'AI_VERIFICATION_FAILED',
+        statusCode: 404,
+      });
     });
   });
 
@@ -617,6 +635,13 @@ describe('VerificationService', () => {
             campaignRef: 'CAMPAIGN-001',
             claimId: 'claim-ref-123',
             packageId: 'PKG-456',
+            contractId: null,
+            verification: expect.objectContaining({
+              passed: expect.any(Boolean),
+              score: expect.any(Number),
+              threshold: expect.any(Number),
+              completedAt: expect.any(String),
+            }),
           },
         },
       });
@@ -670,6 +695,7 @@ describe('VerificationService', () => {
             campaignRef: 'CAMPAIGN-002',
             claimId: 'claim-ref-456',
             packageId: null,
+            contractId: null,
           },
         }),
         expect.any(Object),
@@ -735,6 +761,13 @@ describe('VerificationService', () => {
             campaignRef: 'CAMPAIGN-PARTIAL',
             claimId: null,
             packageId: null,
+            contractId: null,
+            verification: expect.objectContaining({
+              passed: expect.any(Boolean),
+              score: expect.any(Number),
+              threshold: expect.any(Number),
+              completedAt: expect.any(String),
+            }),
           },
         },
       });

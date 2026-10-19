@@ -6,6 +6,10 @@ This module powers:
 - Verification APIs
 - On-chain anchoring integrations
 
+## Dashboard summary cache policy
+
+The global dashboard summary endpoint uses the Redis-backed analytics aggregate at `analytics:global-stats-v2` with a bounded staleness policy of 300 seconds (5 minutes). Reads hit the cached aggregate first; a cache miss recomputes the totals from Prisma, and any campaign or claim mutation invalidates the analytics cache so the next read refreshes promptly. The cache is safe to miss on startup or startup with a cold Redis instance and gracefully falls back to a live database aggregation without breaking the API response shape.
+
 ## Local development
 
 From the repo root:
@@ -63,6 +67,10 @@ All environment variables are documented in [`.env.example`](.env.example) with 
 | `METRICS_ENABLED` | Enable Prometheus metrics at `/metrics` | `false` | No |
 | `LOG_LEVEL` | Logging level (`debug`, `info`, `warn`, `error`) | `debug` | No |
 | `SENTRY_DSN` | Sentry DSN for error tracking | None | No |
+| **Idempotency Key Retention** |
+| `IDEMPOTENCY_KEY_TTL_HOURS` | Retention window for idempotency keys in hours; new records expire after this many hours | `24` | No |
+| `IDEMPOTENCY_PURGE_BATCH_SIZE` | Max expired idempotency keys deleted per purge batch | `500` | No |
+| `IDEMPOTENCY_PURGE_MAX_BATCHES_PER_RUN` | Max purge batches per scheduled run (bounds a single run) | `100` | No |
 | **Feature Flags** |
 | `SWAGGER_ENABLED` | Enable API docs at `/api/docs` | `true` | No |
 | `API_VERSIONING_ENABLED` | Enable API versioning | `true` | No |
@@ -128,6 +136,16 @@ pnpm --filter backend prisma:migrate
 ## Routes
 
 - `GET /health`
+- `DELETE /recipients/:recipientRef` records recipient removal with a required
+  `reasonCode` (`duplicate`, `deceased`, `relocated`, `ineligible`,
+  `consent_withdrawn`, `fraud_flag`, `data_correction`, or `other`). The
+  authenticated actor and database timestamp are recorded independently of
+  the general audit log.
+- `GET /recipients/removals` queries removal records; optional
+  `recipientRef`, `page` (default `1`), and `limit` (default `50`, max `200`)
+  filters are supported. NGO actors are scoped to their own organization;
+  admins can query across organizations. Historical claims are not deleted or
+  modified.
 
 Example:
 
@@ -242,6 +260,25 @@ curl http://localhost:3001/metrics
 - `webhook_retries_total` - Webhook delivery retry count
 - `jobs_processed_total` / `jobs_failed_total` - Background job success/failure rates
 - `onchain_operations_total` - On-chain operation counts by status
+- `idempotency_keys_purged_total` - Expired idempotency keys deleted by the GC job
+- `idempotency_purge_executions_total` - Purge executions by status (`success`/`failed`)
+- `idempotency_purge_failures_total` - Purge failures by reason
+
+### Idempotency Key Garbage Collection
+
+Idempotency records (`IdempotencyKey`) carry an explicit `expiresAt` set at
+creation time from `IDEMPOTENCY_KEY_TTL_HOURS`. Lookups only consider
+non-expired records, so an expired-but-not-yet-purged key is treated as absent
+and can be reused immediately.
+
+A scheduled purge runs hourly (cron `idempotency-key-expiry-purge`, UTC) and
+enqueues a job on the `retention-purge` BullMQ queue. The job deletes expired
+records in bounded batches (`IDEMPOTENCY_PURGE_BATCH_SIZE` per batch, at most
+`IDEMPOTENCY_PURGE_MAX_BATCHES_PER_RUN` batches per run) and emits the
+`idempotency_keys_purged_total` and `idempotency_purge_executions_total`
+metrics plus structured `idempotency-key-purge` log lines. Expiration semantics
+are independent of the schedule: keys become invalid at `expiresAt` even if the
+cleanup job has not run yet.
 
 **Structured logging fields:**
 - `request_id` - Unique identifier for each request (from X-Request-ID header)

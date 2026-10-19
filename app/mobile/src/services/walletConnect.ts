@@ -2,7 +2,13 @@ import * as ExpoLinking from 'expo-linking';
 import SignClient from '@walletconnect/sign-client';
 
 import { config, getStellarChainId } from '../config';
-import { detectWalletNetwork } from './networkGuard';
+import {
+  secureRead,
+  secureWrite,
+  secureDelete,
+  SECURE_KEY_WC_SESSION,
+  SecureStorageUnavailableError,
+} from './secureStorage';
 
 const APP_SCHEME = 'soter';
 const DEFAULT_APP_URL = 'https://github.com/Pulsefy/Soter';
@@ -81,63 +87,6 @@ const getSessionAccounts = (session: SessionShape) => {
   );
 };
 
-const getSessionExpiry = (session: SessionShape) => {
-  const expiry = (session as SessionShape & { expiry?: number | string }).expiry;
-
-  if (typeof expiry === 'number') {
-    return expiry;
-  }
-
-  if (typeof expiry === 'string') {
-    const parsedValue = Number(expiry);
-    if (!Number.isNaN(parsedValue)) {
-      return parsedValue;
-    }
-  }
-
-  return null;
-};
-
-const ensureValidWalletSessionState = (
-  session: SessionShape,
-  accounts: string[],
-  publicKey: string | null,
-  chainIds: string[],
-) => {
-  if (!accounts.length) {
-    throw new Error('The stored WalletConnect session is missing account state. Reconnect to continue.');
-  }
-
-  if (!publicKey) {
-    throw new Error('The stored WalletConnect session did not expose a Stellar account. Reconnect and approve the Stellar namespace again.');
-  }
-
-  if (!chainIds.length) {
-    throw new Error('The stored WalletConnect session did not expose usable chain information. Reconnect to continue.');
-  }
-
-  const expiry = getSessionExpiry(session);
-  if (expiry !== null && expiry <= Math.floor(Date.now() / 1000)) {
-    throw new Error('The stored WalletConnect session is expired. Reconnect to continue.');
-  }
-
-  const expectedChainId = getWalletConnectChainId();
-  const expectedNetwork = expectedChainId.split(':')[1];
-  const networkInfo = detectWalletNetwork(chainIds);
-
-  if (!networkInfo.isKnown) {
-    throw new Error('The restored wallet session could not be validated. Reconnect and ensure your wallet is on the expected network.');
-  }
-
-  if (expectedNetwork === 'testnet' && !networkInfo.isTestnet) {
-    throw new Error('The restored wallet session is on the wrong network. Switch your wallet to Testnet and reconnect.');
-  }
-
-  if (expectedNetwork === 'public' && !networkInfo.isMainnet) {
-    throw new Error('The restored wallet session is on the wrong network. Switch your wallet to Mainnet and reconnect.');
-  }
-};
-
 export const extractPublicKeyFromAccounts = (accounts: string[]) => {
   const stellarAccount = accounts.find((account) => account.startsWith(`${STELLAR_NAMESPACE}:`));
   if (!stellarAccount) {
@@ -162,21 +111,20 @@ export const extractChainIdsFromAccounts = (accounts: string[]) => {
 const toConnectedWalletSession = (session: SessionShape): ConnectedWalletSession => {
   const accounts = getSessionAccounts(session);
   const publicKey = extractPublicKeyFromAccounts(accounts);
-  const chainIds = extractChainIdsFromAccounts(accounts);
 
-  ensureValidWalletSessionState(session, accounts, publicKey, chainIds);
+  if (!publicKey) {
+    throw new Error(
+      'The connected wallet did not expose a Stellar account. Make sure the wallet approved the Stellar namespace.',
+    );
+  }
 
   return {
     topic: session.topic,
-    publicKey: publicKey as string,
+    publicKey,
     accounts,
     walletName: session.peer?.metadata?.name ?? null,
-    chainIds,
+    chainIds: extractChainIdsFromAccounts(accounts),
   };
-};
-
-export const validateRestoredWalletSession = (session: SessionShape): ConnectedWalletSession => {
-  return toConnectedWalletSession(session);
 };
 
 const getSignClient = async () => {
@@ -271,7 +219,18 @@ export const createWalletConnection = async () => {
 
   return {
     pairingUri: uri,
-    approval: async () => toConnectedWalletSession(await approval()),
+    approval: async () => {
+      const session = toConnectedWalletSession(await approval());
+
+      // Persist the approved session topic to secure storage.
+      try {
+        await secureWrite(SECURE_KEY_WC_SESSION, session.topic);
+      } catch {
+        // Non-fatal: WalletConnect's own relay store is the source of truth.
+      }
+
+      return session;
+    },
   };
 };
 
@@ -287,8 +246,24 @@ export const restoreWalletSession = async () => {
       return null;
     }
 
-    return validateRestoredWalletSession(sessions[0] as SessionShape);
+    const session = sessions[0] as SessionShape;
+    const restored = toConnectedWalletSession(session);
+
+    // Persist the active topic to secure storage so it survives a cold start
+    // even before the WalletConnect relay can confirm the session.
+    // This is a best-effort write — a failure here should not block the restore.
+    try {
+      await secureWrite(SECURE_KEY_WC_SESSION, restored.topic);
+    } catch {
+      // Non-fatal: the SignClient's own store is still the source of truth.
+    }
+
+    return restored;
   } catch (error) {
+    // Re-throw SecureStorageUnavailableError so WalletContext can detect it.
+    if (error instanceof SecureStorageUnavailableError) {
+      throw error;
+    }
     throw new Error(getErrorMessage(error));
   }
 };
@@ -302,6 +277,9 @@ export const disconnectWalletSession = async (topic: string) => {
       message: 'User disconnected.',
     },
   });
+
+  // Remove the session topic from secure storage so no stale reference remains.
+  await secureDelete(SECURE_KEY_WC_SESSION);
 };
 
 export const createWalletCallbackUrl = () => {

@@ -215,6 +215,15 @@ export class ClaimAidPackageDto {
   })
   @IsString()
   packageId: string;
+
+  @ApiProperty({
+    description: 'Optional amount to claim (for partial/tranche claims)',
+    example: '500000000',
+    required: false,
+  })
+  @IsString()
+  @IsOptional()
+  amount?: string;
 }
 
 /**
@@ -251,4 +260,58 @@ export class GetAidPackageStatsDto {
   })
   @IsString()
   tokenAddress: string;
+}
+
+/**
+ * DTO for extending the expiry of an aid package.
+ * Follows the canonical absolute timestamp convention (`newExpiresAt`).
+ */
+export class ExtendAidPackageExpiryDto {
+  @ApiProperty({
+    description:
+      'New unix timestamp (in seconds) when the package expires. Must be strictly greater than current expiration timestamp.',
+    example: 1735689600,
+  })
+  @Type(() => Number)
+  @IsNumber()
+  @Min(1)
+  newExpiresAt: number;
+}
+
+// --- Delegate Operation DTOs ---
+
+/**
+ * DTO for setting a delegate on a package
+ */
+export class SetDelegateDto {
+  @ApiProperty({
+    description: 'Stellar address of the delegate to assign',
+    example: 'GBUQWP3BOUZX34ULNQG23RQ6F4BFXWBTRSE53XSTE23JMCVOCJGXVSVZ',
+  })
+  @IsString()
+  delegateAddress: string;
+
+  @ApiProperty({
+    description:
+      'Optional unix timestamp when this delegation expires. Omit for a permanent (until revoked) delegation.',
+    example: 1735689600,
+    required: false,
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  @Min(1)
+  expiresAt?: number;
+}
+
+/**
+ * DTO for querying an aid package by ID (used for GET param binding)
+ */
+export class GetPackageDelegateDto {
+  @ApiProperty({
+    description: 'Package ID to look up the delegate for',
+    example: 'pkg_123456789',
+  })
+  @IsString()
+  packageId: string;
 }

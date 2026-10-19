@@ -1,9 +1,5 @@
-import {
-  CanActivate,
-  ExecutionContext,
-  Injectable,
-  UnauthorizedException,
-} from '@nestjs/common';
+import { AppException, ERROR_CODES } from '../../common/dto/error-response.dto';
+import { CanActivate, ExecutionContext, Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Reflector } from '@nestjs/core';
 import { Request } from 'express';
@@ -50,20 +46,56 @@ export class ApiKeyGuard implements CanActivate {
           : undefined;
 
     if (!apiKey) {
-      throw new UnauthorizedException('Invalid or missing API key');
+      throw new AppException(
+        ERROR_CODES.UNAUTHORIZED,
+        401,
+        'Invalid or missing API key',
+      );
     }
 
     const apiKeyHash = createHash('sha256').update(apiKey).digest('hex');
 
-    // Primary path: look up the key in the database (hashed preferred; legacy plaintext supported)
+    // Look up by credential match only; lifecycle state (revocation, expiry,
+    // rotation grace window) is evaluated below so each failure mode produces
+    // a distinguishable error response.
     const record = await this.prisma.apiKey.findFirst({
       where: {
-        revokedAt: null,
         OR: [{ keyHash: apiKeyHash }, { key: apiKey }],
       },
     });
 
     if (record) {
+      const now = Date.now();
+
+      if (record.revokedAt && record.revokedAt.getTime() <= now) {
+        throw new AppException(
+          ERROR_CODES.UNAUTHORIZED,
+          401,
+          'API key has been revoked',
+        );
+      }
+
+      if (record.expiresAt && record.expiresAt.getTime() <= now) {
+        throw new AppException(
+          ERROR_CODES.UNAUTHORIZED,
+          401,
+          'API key has expired',
+        );
+      }
+
+      // A rotated-out predecessor stays valid until its grace window ends.
+      if (
+        record.graceExpiresAt &&
+        record.graceExpiresAt.getTime() <= now &&
+        record.replacedById
+      ) {
+        throw new AppException(
+          ERROR_CODES.UNAUTHORIZED,
+          401,
+          'API key has been rotated and its grace period has ended',
+        );
+      }
+
       // Record usage for lifecycle visibility (best-effort, but awaited to ensure consistency in tests)
       await this.prisma.apiKey.update({
         where: { id: record.id },
@@ -72,7 +104,8 @@ export class ApiKeyGuard implements CanActivate {
 
       request.user = {
         role: record.role,
-        ngoId: record.ngoId,
+        ngoId: record.ngoId ?? record.orgId,
+        orgId: record.orgId ?? record.ngoId,
         apiKeyId: record.id,
         authType: 'apiKey',
         scopes: parseScopes(record.scopes),
@@ -92,6 +125,10 @@ export class ApiKeyGuard implements CanActivate {
       return true;
     }
 
-    throw new UnauthorizedException('Invalid or missing API key');
+    throw new AppException(
+      ERROR_CODES.UNAUTHORIZED,
+      401,
+      'Invalid or missing API key',
+    );
   }
 }

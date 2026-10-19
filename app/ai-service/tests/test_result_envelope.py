@@ -10,6 +10,7 @@ Every successful AI inference response must conform to:
     "trace_id":        str | null,
   }
 """
+
 from __future__ import annotations
 
 import json
@@ -29,6 +30,7 @@ client = TestClient(app, raise_server_exceptions=False)
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def assert_envelope(data: Dict[str, Any]) -> None:
     """Assert that *data* is a well-formed ResultEnvelope."""
     assert "result" in data, f"Missing 'result' key: {data}"
@@ -36,29 +38,37 @@ def assert_envelope(data: Dict[str, Any]) -> None:
     assert "reasons" in data, f"Missing 'reasons' key: {data}"
     assert "anchor_metadata" in data, f"Missing 'anchor_metadata' key: {data}"
     assert "trace_id" in data, f"Missing 'trace_id' key: {data}"
+    assert "prompt_version" in data, f"Missing 'prompt_version' key: {data}"
 
     # confidence is either null or a float in [0, 1]
     if data["confidence"] is not None:
-        assert isinstance(data["confidence"], float), (
-            f"confidence must be float, got {type(data['confidence'])}"
-        )
-        assert 0.0 <= data["confidence"] <= 1.0, (
-            f"confidence out of range: {data['confidence']}"
-        )
+        assert isinstance(
+            data["confidence"], float
+        ), f"confidence must be float, got {type(data['confidence'])}"
+        assert (
+            0.0 <= data["confidence"] <= 1.0
+        ), f"confidence out of range: {data['confidence']}"
 
     # reasons is either null or a non-empty list of strings
     if data["reasons"] is not None:
-        assert isinstance(data["reasons"], list), (
-            f"reasons must be list, got {type(data['reasons'])}"
-        )
+        assert isinstance(
+            data["reasons"], list
+        ), f"reasons must be list, got {type(data['reasons'])}"
         assert len(data["reasons"]) > 0, "reasons list must not be empty"
         for r in data["reasons"]:
             assert isinstance(r, str), f"Each reason must be a string, got {type(r)}"
+
+    # prompt_version is either null or a string
+    if data["prompt_version"] is not None:
+        assert isinstance(
+            data["prompt_version"], str
+        ), f"prompt_version must be str, got {type(data['prompt_version'])}"
 
 
 # ---------------------------------------------------------------------------
 # OCR endpoint
 # ---------------------------------------------------------------------------
+
 
 class TestOCREnvelope:
     _FAKE_OCR_RESULT = {
@@ -142,11 +152,22 @@ class TestOCREnvelope:
 # Fraud detection endpoint
 # ---------------------------------------------------------------------------
 
+
 class TestFraudEnvelope:
     _CLAIMS_PAYLOAD = {
         "claims": [
-            {"claim_id": "c1", "ip_address": "1.2.3.4", "amount": 100.0, "location": "Lagos"},
-            {"claim_id": "c2", "ip_address": "1.2.3.4", "amount": 100.0, "location": "Lagos"},
+            {
+                "claim_id": "c1",
+                "ip_address": "1.2.3.4",
+                "amount": 100.0,
+                "location": "Lagos",
+            },
+            {
+                "claim_id": "c2",
+                "ip_address": "1.2.3.4",
+                "amount": 100.0,
+                "location": "Lagos",
+            },
         ],
         "anchor_metadata": {"campaign_ref": "camp-002"},
     }
@@ -178,6 +199,7 @@ class TestFraudEnvelope:
 # ---------------------------------------------------------------------------
 # Anonymize endpoint
 # ---------------------------------------------------------------------------
+
 
 class TestAnonymizeEnvelope:
     _FAKE_ANONYMIZE = {
@@ -235,6 +257,7 @@ class TestAnonymizeEnvelope:
 # Proof-of-life endpoint
 # ---------------------------------------------------------------------------
 
+
 class TestProofOfLifeEnvelope:
     _FAKE_POL_RESULT = {
         "is_real_person": True,
@@ -290,11 +313,14 @@ class TestProofOfLifeEnvelope:
 # Humanitarian endpoint
 # ---------------------------------------------------------------------------
 
+
 class TestHumanitarianEnvelope:
     _FAKE_VERIFY = {
         "provider": "test",
         "model": "test-provider/fixture",
         "prompt_variant": "primary",
+        "prompt_name": "humanitarian_primary",
+        "prompt_version": "v1",
         "verification": {
             "verdict": "credible",
             "confidence": 0.82,
@@ -319,6 +345,17 @@ class TestHumanitarianEnvelope:
             resp = client.post("/v1/ai/humanitarian/verify", json=self._REQUEST)
         assert resp.status_code == 200
         assert_envelope(resp.json())
+
+    def test_prompt_version_recorded_on_envelope(self):
+        with patch.object(
+            main.humanitarian_verification_service,
+            "verify_claim",
+            return_value=self._FAKE_VERIFY,
+        ):
+            data = client.post("/v1/ai/humanitarian/verify", json=self._REQUEST).json()
+        assert data["prompt_version"] == "v1"
+        assert data["result"]["prompt_version"] == "v1"
+        assert data["result"]["prompt_name"] == "humanitarian_primary"
 
     def test_confidence_extracted_from_verification(self):
         with patch.object(
@@ -355,3 +392,40 @@ class TestHumanitarianEnvelope:
         ):
             data = client.post("/v1/ai/humanitarian/verify", json=self._REQUEST).json()
         assert data["result"]["provider"] == "test"
+
+    def test_streaming_and_json_modes_use_deterministic_provider(self, monkeypatch):
+        from config import settings
+        from services.humanitarian_verification import HumanitarianVerificationService
+
+        monkeypatch.setattr(settings, "test_provider_mode", True)
+        monkeypatch.setattr(settings, "openai_api_key", None)
+        monkeypatch.setattr(settings, "groq_api_key", None)
+        service = HumanitarianVerificationService()
+        monkeypatch.setattr(app.state, "humanitarian_verification_service", service)
+
+        regular = client.post(
+            "/v1/ai/humanitarian/verify",
+            json={**self._REQUEST, "aid_claim": "streaming mode deterministic claim"},
+        )
+        streamed = client.post(
+            "/v1/ai/humanitarian/verify?stream=true",
+            json={**self._REQUEST, "aid_claim": "streaming mode deterministic claim"},
+        )
+
+        assert regular.status_code == 200
+        assert streamed.status_code == 200
+        assert streamed.headers["content-type"].startswith("text/event-stream")
+
+        token_events = []
+        result_event = None
+        for event in streamed.text.strip().split("\n\n"):
+            if event.startswith("event: token\n"):
+                token_events.append(json.loads(event.split("data: ", 1)[1])["token"])
+            elif event.startswith("event: result\n"):
+                result_event = json.loads(event.split("data: ", 1)[1])
+
+        assert len(token_events) > 1
+        assert result_event is not None
+        assert result_event["result"] == regular.json()["result"]
+        assert result_event["confidence"] == regular.json()["confidence"]
+        assert result_event["reasons"] == regular.json()["reasons"]

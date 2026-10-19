@@ -1,32 +1,77 @@
-import React, { useMemo } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   View,
   Text,
   Switch,
   StyleSheet,
   Alert,
+  Clipboard,
   Linking,
   Pressable,
   ScrollView,
+  Share,
 } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useTheme } from '../theme/ThemeContext';
 import { AppColors } from '../theme/useAppTheme';
 import { useBiometric } from '../contexts/BiometricContext';
 import { useNotification } from '../contexts/NotificationContext';
 import { useSaverMode } from '../contexts/SaverModeContext';
+import { useCrashReporting } from '../contexts/CrashReportingContext';
+import { useSyncDeferral } from '../contexts/SyncDeferralContext';
+import { useSharedDevice } from '../contexts/SharedDeviceContext';
 import { config } from '../config';
 import { useWallet } from '../contexts/WalletContext';
+import { getAccountExplorerUrl } from '../explorerUtils';
+import type { CacheSummary } from '../services/localCache';
+import { clearAidCache, getAidCacheSummary } from '../services/aidCache';
+import { clearTaskCache, getTaskCacheSummary } from '../services/taskCache';
+import { useTranslation } from '../i18n/useTranslation';
+import { useLanguage } from '../contexts/LanguageContext';
+import { clearHealthCache, loadCachedHealthStatus } from '../services/healthCache';
+import { clearSyncQueue, getSyncQueueState } from '../services/syncQueue';
+import { secureClearAll } from '../services/secureStorage';
+import { structuredLogger } from '../services/logger';
 
 const STELLAR_LAB_FAUCET_URL = 'https://lab.stellar.org/account/fund';
 const STELLAR_FRIENDBOT_URL = 'https://friendbot-testnet.stellar.org';
 
+interface CacheUsageState {
+  aid: CacheSummary;
+  task: CacheSummary;
+  totalSizeBytes: number;
+  totalMaxBytes: number;
+  isNearLimit: boolean;
+  isOverLimit: boolean;
+}
+
+const emptyCacheSummary = (maxBytes: number): CacheSummary => ({
+  sizeBytes: 0,
+  maxBytes,
+  itemCount: 0,
+  isNearLimit: false,
+  isOverLimit: false,
+  warningRatio: config.localCacheWarningRatio,
+});
+
+const formatBytes = (bytes: number) => {
+  if (bytes >= 1024 * 1024) {
+    return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  }
+  if (bytes >= 1024) {
+    return `${(bytes / 1024).toFixed(1)} KB`;
+  }
+  return `${bytes} B`;
+};
+
 export const SettingsScreen: React.FC = () => {
   const { colors } = useTheme();
   const styles = useMemo(() => makeStyles(colors), [colors]);
+  const { t } = useTranslation();
+  const { locale, isOverridden, deviceLocale, setActiveLocale } = useLanguage();
   const { biometricEnabled, biometricSupported, toggleBiometric } = useBiometric();
-  const { permissionGranted, requestPermission } = useNotification();
-  const { disconnectWallet } = useWallet();
+  const { permissionGranted, requestPermission, tokenRegistered } = useNotification();
   const {
     active: saverModeActive,
     source: saverModeSource,
@@ -34,6 +79,45 @@ export const SettingsScreen: React.FC = () => {
     toggleManual,
     toggleAutoDetect,
   } = useSaverMode();
+  const {
+    enabled: crashReportingEnabled,
+    toggle: toggleCrashReporting,
+  } = useCrashReporting();
+  const { enabled: sharedDeviceEnabled, toggle: toggleSharedDevice } = useSharedDevice();
+  const { syncFrequency, setSyncFrequency } = useSyncDeferral();
+  const { publicKey, status: walletStatus } = useWallet();
+  const isWalletConnected = walletStatus === 'connected';
+  const [copiedKey, setCopiedKey] = useState(false);
+  const [cacheUsage, setCacheUsage] = useState<CacheUsageState>({
+    aid: emptyCacheSummary(config.aidCacheMaxBytes),
+    task: emptyCacheSummary(config.taskCacheMaxBytes),
+    totalSizeBytes: 0,
+    totalMaxBytes: config.aidCacheMaxBytes + config.taskCacheMaxBytes,
+    isNearLimit: false,
+    isOverLimit: false,
+  });
+
+  const refreshCacheUsage = useCallback(async () => {
+    const [aid, task] = await Promise.all([
+      getAidCacheSummary(),
+      getTaskCacheSummary(),
+    ]);
+    const totalSizeBytes = aid.sizeBytes + task.sizeBytes;
+    const totalMaxBytes = aid.maxBytes + task.maxBytes;
+
+    setCacheUsage({
+      aid,
+      task,
+      totalSizeBytes,
+      totalMaxBytes,
+      isNearLimit: aid.isNearLimit || task.isNearLimit,
+      isOverLimit: aid.isOverLimit || task.isOverLimit,
+    });
+  }, []);
+
+  useEffect(() => {
+    void refreshCacheUsage();
+  }, [refreshCacheUsage]);
 
   const handleNotificationToggle = async (value: boolean) => {
     if (value) {
@@ -63,21 +147,6 @@ export const SettingsScreen: React.FC = () => {
     await toggleBiometric(value);
   };
 
-  const handleResetWalletSession = () => {
-    Alert.alert(
-      'Reset Wallet Session',
-      'This will clear the current WalletConnect session and let you reconnect safely.',
-      [
-        { text: 'Cancel', style: 'cancel' },
-        {
-          text: 'Reset',
-          style: 'destructive',
-          onPress: () => void disconnectWallet(),
-        },
-      ],
-    );
-  };
-
   const openFaucetTool = async (url: string) => {
     try {
       await Linking.openURL(url);
@@ -85,6 +154,174 @@ export const SettingsScreen: React.FC = () => {
       Alert.alert(
         'Unable to Open Link',
         'Please try again or open the faucet from your browser.',
+      );
+    }
+  };
+
+  const copyPublicKey = async () => {
+    if (!publicKey) return;
+    try {
+      Clipboard.setString(publicKey);
+      setCopiedKey(true);
+      setTimeout(() => setCopiedKey(false), 2000);
+    } catch {
+      Alert.alert('Error', 'Failed to copy public key to clipboard.');
+    }
+  };
+
+  const openAccountExplorer = async () => {
+    if (!publicKey) return;
+    const url = getAccountExplorerUrl(publicKey);
+    try {
+      await Linking.openURL(url);
+    } catch {
+      Alert.alert(
+        'Unable to Open Link',
+        'Could not open the Stellar Expert explorer.',
+      );
+    }
+  };
+
+  const clearLocalCaches = async () => {
+    try {
+      const [aidResult, taskResult] = await Promise.all([
+        clearAidCache(),
+        clearTaskCache(),
+      ]);
+      await refreshCacheUsage();
+      const retainedCount = aidResult.items.length + taskResult.items.length;
+      Alert.alert(
+        'Offline Cache Cleared',
+        retainedCount > 0
+          ? `${retainedCount} unsynced item${retainedCount === 1 ? '' : 's'} retained for safety.`
+          : 'Cached aid and task data was cleared.',
+      );
+    } catch {
+      Alert.alert('Unable to Clear Cache', 'Please try again from Settings.');
+    }
+  };
+
+  const exportLocalData = async () => {
+    try {
+      const [aid, task, keys, queueState, healthStatus] = await Promise.all([
+        getAidCacheSummary(),
+        getTaskCacheSummary(),
+        AsyncStorage.getAllKeys(),
+        getSyncQueueState(),
+        loadCachedHealthStatus(),
+      ]);
+      const unsyncedCount = queueState.items.filter(
+        (item) => item.state !== 'submitted',
+      ).length;
+      const queueSummary = queueState.items.length
+        ? queueState.items
+            .map((item) => `- ${item.type}: ${item.state}`)
+            .join('\n')
+        : '- No queued items';
+      const aidDetailsCount = keys.filter(
+        (key) =>
+          key.startsWith('@soter/aid_details_') &&
+          !key.startsWith('@soter/aid_details_timestamp_'),
+      ).length;
+      const summary = `Soter Local Data Summary
+Generated: ${new Date().toISOString()}
+
+Cached data
+- Aid packages: ${aid.itemCount} (${formatBytes(aid.sizeBytes)})
+- Aid details: ${aidDetailsCount}
+- Tasks: ${task.itemCount} (${formatBytes(task.sizeBytes)})
+- Health diagnostics cache: ${healthStatus ? 'available' : 'none'}
+
+Sync queue
+- ${unsyncedCount} unsynced item${unsyncedCount === 1 ? '' : 's'} of ${queueState.items.length}
+${queueSummary}
+
+Recent diagnostics
+${structuredLogger.getDiagnosticsText(12)}`;
+      await Share.share({
+        title: 'Soter Local Data Summary',
+        message: summary,
+      });
+    } catch {
+      Alert.alert(
+        t('settings.exportFailedTitle'),
+        t('settings.exportFailedMessage'),
+      );
+    }
+  };
+
+  const showClearLocalDataConfirmation = async () => {
+    try {
+      const queueState = await getSyncQueueState();
+      const unsyncedCount = queueState.items.filter(
+        (item) => item.state !== 'submitted',
+      ).length;
+      Alert.alert(
+        t('settings.clearLocalDataConfirmTitle'),
+        `${t('settings.clearLocalDataConfirmBase')}\n\n${t('settings.queuedItemsWillBeRemoved', { count: queueState.items.length })}\n\n${unsyncedCount > 0 ? t('settings.unsyncedQueueWillBeLost', { count: unsyncedCount }) : t('settings.noUnsyncedQueue')}\n\n${t('settings.cannotUndo')}`,
+        [
+          { text: t('common.cancel'), style: 'cancel' },
+          {
+            text: t('settings.clearAllLocalData'),
+            style: 'destructive',
+            onPress: () =>
+              void clearAllLocalData(queueState.items.length, unsyncedCount),
+          },
+        ],
+      );
+    } catch {
+      Alert.alert(
+        t('settings.queueCheckFailedTitle'),
+        t('settings.queueCheckFailedMessage'),
+      );
+    }
+  };
+
+  const clearAllLocalData = async (
+    confirmedQueueCount: number,
+    confirmedUnsyncedCount: number,
+  ) => {
+    try {
+      const queueState = await getSyncQueueState();
+      const unsyncedCount = queueState.items.filter(
+        (item) => item.state !== 'submitted',
+      ).length;
+      if (
+        queueState.items.length !== confirmedQueueCount ||
+        unsyncedCount !== confirmedUnsyncedCount
+      ) {
+        await showClearLocalDataConfirmation();
+        return;
+      }
+
+      const legacyKeys = [
+        'biometric_lock_enabled',
+        'SOTER_PROCESSED_NOTIFICATION_IDS',
+        'SOTER_DEVICE_TOKEN_ID',
+      ];
+      const appKeys = (await AsyncStorage.getAllKeys()).filter(
+        (key) =>
+          key.startsWith('@soter/') ||
+          key.startsWith('@Soter:') ||
+          legacyKeys.includes(key),
+      );
+
+      await clearSyncQueue();
+      await AsyncStorage.multiRemove([
+        ...new Set([...appKeys, '@soter/sync-queue']),
+      ]);
+      await clearHealthCache();
+      await secureClearAll();
+      structuredLogger.clear();
+      await refreshCacheUsage();
+      Alert.alert(
+        t('settings.localDataClearedTitle'),
+        t('settings.localDataClearedMessage'),
+      );
+    } catch {
+      Alert.alert(
+        t('settings.clearLocalDataFailedTitle'),
+        t('settings.clearLocalDataFailedMessage'),
       );
     }
   };
@@ -99,7 +336,67 @@ export const SettingsScreen: React.FC = () => {
           style={styles.sectionHeader}
           accessibilityRole="header"
         >
-          Security
+          {t('settings.language')}
+        </Text>
+        <Text style={styles.sectionHint}>{t('settings.languageHint')}</Text>
+
+        <View style={styles.languageRow}>
+          <Pressable
+            style={[
+              styles.languageChip,
+              !isOverridden && styles.languageChipActive,
+            ]}
+            accessibilityRole="radio"
+            accessibilityState={{ selected: !isOverridden }}
+            accessibilityLabel={t('settings.followDevice')}
+            onPress={() => void setActiveLocale(deviceLocale)}
+          >
+            <Text
+              style={[
+                styles.languageChipText,
+                !isOverridden && styles.languageChipTextActive,
+              ]}
+            >
+              {t('settings.followDevice')}
+            </Text>
+          </Pressable>
+          {(['en', 'es', 'fr'] as const).map((code) => {
+            const label =
+              code === 'en'
+                ? t('common.languageNameEn')
+                : code === 'es'
+                  ? t('common.languageNameEs')
+                  : t('common.languageNameFr');
+            return (
+              <Pressable
+                key={code}
+                style={[
+                  styles.languageChip,
+                  locale === code && styles.languageChipActive,
+                ]}
+                accessibilityRole="radio"
+                accessibilityState={{ selected: locale === code }}
+                accessibilityLabel={label}
+                onPress={() => void setActiveLocale(code)}
+              >
+                <Text
+                  style={[
+                    styles.languageChipText,
+                    locale === code && styles.languageChipTextActive,
+                  ]}
+                >
+                  {label}
+                </Text>
+              </Pressable>
+            );
+          })}
+        </View>
+
+        <Text
+          style={styles.sectionHeader}
+          accessibilityRole="header"
+        >
+          {t('settings.securityTitle')}
         </Text>
 
         {/* The row is a single accessible group so VoiceOver/TalkBack reads
@@ -121,7 +418,7 @@ export const SettingsScreen: React.FC = () => {
           onAccessibilityTap={() => void handleToggle(!biometricEnabled)}
         >
           <View style={styles.rowText}>
-            <Text style={styles.rowTitle}>Biometric Lock</Text>
+            <Text style={styles.rowTitle}>{t('settings.biometricLock')}</Text>
             <Text style={styles.rowSubtitle}>
               Require Face ID / Fingerprint before viewing sensitive aid details
             </Text>
@@ -148,28 +445,38 @@ export const SettingsScreen: React.FC = () => {
           </Text>
         )}
 
-        <Text
-          style={styles.sectionHeader}
-          accessibilityRole="header"
-        >
-          Wallet
-        </Text>
-
-        <Pressable
+        {/* Shared Device Mode toggle */}
+        <View
           style={styles.row}
-          accessibilityRole="button"
-          accessibilityLabel="Reset Wallet Session"
-          accessibilityHint="Clears a stale or broken WalletConnect session so you can reconnect safely"
-          onPress={handleResetWalletSession}
+          accessible
+          accessibilityRole="switch"
+          accessibilityLabel="Shared Device Mode"
+          accessibilityHint="Automatically sign out when the app is backgrounded. Useful for devices shared between workers."
+          accessibilityValue={{ text: sharedDeviceEnabled ? 'on' : 'off' }}
+          accessibilityState={{ checked: sharedDeviceEnabled }}
+          onAccessibilityTap={() => void toggleSharedDevice(!sharedDeviceEnabled)}
         >
           <View style={styles.rowText}>
-            <Text style={styles.rowTitle}>Reset Wallet Session</Text>
+            <Text style={styles.rowTitle}>{t('settings.sharedDeviceMode')}</Text>
             <Text style={styles.rowSubtitle}>
-              Clear a stale, broken, or partially restored WalletConnect session.
+              Automatically sign out when the app is backgrounded
             </Text>
           </View>
-          <Text style={styles.resetButtonText}>Reset</Text>
-        </Pressable>
+          <Switch
+            value={sharedDeviceEnabled}
+            onValueChange={(v) => void toggleSharedDevice(v)}
+            trackColor={{ false: colors.border, true: colors.brand.primary }}
+            thumbColor="#FFFFFF"
+            importantForAccessibility="no-hide-descendants"
+            accessibilityElementsHidden
+          />
+        </View>
+
+        {sharedDeviceEnabled && (
+          <Text style={styles.hint} accessibilityRole="alert">
+            When enabled, the wallet session will be cleared if the app is backgrounded for more than 5 seconds. Re-authentication will be required on return.
+          </Text>
+        )}
 
         <Text
           style={styles.sectionHeader}
@@ -189,10 +496,15 @@ export const SettingsScreen: React.FC = () => {
           onAccessibilityTap={() => void handleNotificationToggle(!permissionGranted)}
         >
           <View style={styles.rowText}>
-            <Text style={styles.rowTitle}>Push Notifications</Text>
+            <Text style={styles.rowTitle}>{t('settings.pushNotifications')}</Text>
             <Text style={styles.rowSubtitle}>
               Receive updates for claim and verification status changes
             </Text>
+            {permissionGranted && (
+              <Text style={[styles.rowSubtitle, { color: tokenRegistered ? colors.text.secondary : colors.error }]}>
+                {tokenRegistered ? 'Registered with backend' : 'Backend registration failed'}
+              </Text>
+            )}
           </View>
           <Switch
             value={permissionGranted}
@@ -203,6 +515,49 @@ export const SettingsScreen: React.FC = () => {
             accessibilityElementsHidden
           />
         </View>
+
+        <Text
+          style={styles.sectionHeader}
+          accessibilityRole="header"
+        >
+          Crash Reporting
+        </Text>
+
+        <View
+          style={styles.row}
+          accessible
+          accessibilityRole="switch"
+          accessibilityLabel="Crash Reporting"
+          accessibilityHint="Help improve the app by sending anonymous crash reports. No personal data or evidence is collected."
+          accessibilityValue={{ text: crashReportingEnabled ? 'on' : 'off' }}
+          accessibilityState={{ checked: crashReportingEnabled }}
+          onAccessibilityTap={() =>
+            void toggleCrashReporting(!crashReportingEnabled)
+          }
+        >
+          <View style={styles.rowText}>
+            <Text style={styles.rowTitle}>{t('settings.crashReporting')}</Text>
+            <Text style={styles.rowSubtitle}>
+              Send anonymous crash reports to help fix issues. No personal data
+              or evidence content is collected.
+            </Text>
+          </View>
+          <Switch
+            value={crashReportingEnabled}
+            onValueChange={(v) => void toggleCrashReporting(v)}
+            trackColor={{ false: colors.border, true: colors.brand.primary }}
+            thumbColor="#FFFFFF"
+            importantForAccessibility="no-hide-descendants"
+            accessibilityElementsHidden
+          />
+        </View>
+
+        {!crashReportingEnabled && (
+          <Text style={styles.hint} accessibilityRole="alert">
+            Crash reporting is off. Crashes will not be sent to the development
+            team.
+          </Text>
+        )}
 
         <Text
           style={styles.sectionHeader}
@@ -223,7 +578,7 @@ export const SettingsScreen: React.FC = () => {
           onAccessibilityTap={() => void toggleManual(!saverModeActive)}
         >
           <View style={styles.rowText}>
-            <Text style={styles.rowTitle}>Saver Mode</Text>
+            <Text style={styles.rowTitle}>{t('settings.saverMode')}</Text>
             <Text style={styles.rowSubtitle}>
               Reduce data usage by limiting refresh, media, and background sync
             </Text>
@@ -258,7 +613,7 @@ export const SettingsScreen: React.FC = () => {
           onAccessibilityTap={() => void toggleAutoDetect(!autoDetectEnabled)}
         >
           <View style={styles.rowText}>
-            <Text style={styles.rowTitle}>Auto-detect</Text>
+            <Text style={styles.rowTitle}>{t('settings.autoDetect')}</Text>
             <Text style={styles.rowSubtitle}>
               Automatically enable Saver Mode on slow or metered connections
             </Text>
@@ -273,6 +628,148 @@ export const SettingsScreen: React.FC = () => {
           />
         </View>
 
+        <Text
+          style={styles.sectionHeader}
+          accessibilityRole="header"
+        >
+          {t('settings.syncFrequency')}
+        </Text>
+        <Text style={styles.sectionHint}>{t('settings.syncFrequencyHint')}</Text>
+
+        <View style={styles.frequencyRow}>
+          {(['aggressive', 'normal', 'conservative'] as const).map((freq) => {
+            const isSelected = syncFrequency === freq;
+            const label =
+              freq === 'aggressive'
+                ? t('settings.syncFrequencyAggressive')
+                : freq === 'normal'
+                  ? t('settings.syncFrequencyNormal')
+                  : t('settings.syncFrequencyConservative');
+            const hint =
+              freq === 'aggressive'
+                ? t('settings.syncFrequencyAggressiveHint')
+                : freq === 'normal'
+                  ? t('settings.syncFrequencyNormalHint')
+                  : t('settings.syncFrequencyConservativeHint');
+
+            return (
+              <Pressable
+                key={freq}
+                style={[
+                  styles.frequencyChip,
+                  isSelected && styles.frequencyChipActive,
+                ]}
+                accessibilityRole="radio"
+                accessibilityState={{ selected: isSelected }}
+                accessibilityLabel={label}
+                accessibilityHint={hint}
+                onPress={() => void setSyncFrequency(freq)}
+              >
+                <Text
+                  style={[
+                    styles.frequencyChipText,
+                    isSelected && styles.frequencyChipTextActive,
+                  ]}
+                >
+                  {label}
+                </Text>
+              </Pressable>
+            );
+          })}
+        </View>
+
+        <Text style={styles.hint}>
+          {syncFrequency === 'aggressive'
+            ? t('settings.syncFrequencyAggressiveHint')
+            : syncFrequency === 'conservative'
+              ? t('settings.syncFrequencyConservativeHint')
+              : t('settings.syncFrequencyNormalHint')}
+        </Text>
+
+        <Text
+          style={styles.sectionHeader}
+          accessibilityRole="header"
+        >
+          Offline Storage
+        </Text>
+
+        <View style={styles.cachePanel}>
+          {(cacheUsage.isNearLimit || cacheUsage.isOverLimit) && (
+            <Text style={styles.cacheWarning} accessibilityRole="alert">
+              Offline cache is nearing its storage limit. Clear synced cache
+              data to keep room for evidence capture.
+            </Text>
+          )}
+
+          <View style={styles.cacheMetricRow}>
+            <Text style={styles.cacheMetricLabel}>{t('settings.aidCache')}</Text>
+            <Text style={styles.cacheMetricValue}>
+              {formatBytes(cacheUsage.aid.sizeBytes)} / {formatBytes(cacheUsage.aid.maxBytes)}
+            </Text>
+          </View>
+          <Text style={styles.cacheMetricHint}>
+            {cacheUsage.aid.itemCount} package{cacheUsage.aid.itemCount === 1 ? '' : 's'} cached
+          </Text>
+
+          <View style={styles.cacheMetricRow}>
+            <Text style={styles.cacheMetricLabel}>{t('settings.taskCache')}</Text>
+            <Text style={styles.cacheMetricValue}>
+              {formatBytes(cacheUsage.task.sizeBytes)} / {formatBytes(cacheUsage.task.maxBytes)}
+            </Text>
+          </View>
+          <Text style={styles.cacheMetricHint}>
+            {cacheUsage.task.itemCount} task{cacheUsage.task.itemCount === 1 ? '' : 's'} cached
+          </Text>
+
+          <View style={styles.cacheMetricRow}>
+            <Text style={styles.cacheMetricLabel}>{t('settings.cacheTotal')}</Text>
+            <Text style={styles.cacheMetricValue}>
+              {formatBytes(cacheUsage.totalSizeBytes)} / {formatBytes(cacheUsage.totalMaxBytes)}
+            </Text>
+          </View>
+
+          <Pressable
+            style={({ pressed }) => [
+              styles.secondaryLinkButton,
+              pressed && styles.linkButtonPressed,
+            ]}
+            accessibilityRole="button"
+            accessibilityLabel="Clear synced offline cache"
+            accessibilityHint="Removes cached aid and task data while keeping unsynced local changes"
+            onPress={() => void clearLocalCaches()}
+          >
+            <Text style={styles.secondaryLinkButtonText}>{t('settings.clearSyncedCache')}</Text>
+          </Pressable>
+          <Pressable
+            style={({ pressed }) => [
+              styles.secondaryLinkButton,
+              pressed && styles.linkButtonPressed,
+            ]}
+            accessibilityRole="button"
+            accessibilityLabel={t('settings.exportLocalData')}
+            accessibilityHint={t('settings.exportLocalDataHint')}
+            onPress={() => void exportLocalData()}
+          >
+            <Text style={styles.secondaryLinkButtonText}>
+              {t('settings.exportLocalData')}
+            </Text>
+          </Pressable>
+          <Pressable
+            style={({ pressed }) => [
+              styles.secondaryLinkButton,
+              pressed && styles.linkButtonPressed,
+            ]}
+            accessibilityRole="button"
+            accessibilityLabel={t('settings.clearAllLocalData')}
+            accessibilityHint={t('settings.clearAllLocalDataHint')}
+            onPress={() => void showClearLocalDataConfirmation()}
+          >
+            <Text style={[styles.secondaryLinkButtonText, { color: colors.error }]}>
+              {t('settings.clearAllLocalData')}
+            </Text>
+          </Pressable>
+        </View>
+
         {config.network === 'testnet' && (
           <>
             <Text
@@ -284,8 +781,70 @@ export const SettingsScreen: React.FC = () => {
 
             <View style={styles.faucetPanel}>
               <Text style={styles.faucetCopy}>
-                Fund demo accounts with free test XLM from Stellar.
+                Fund your testnet wallet with free XLM from the Stellar
+                development network. Copy your public key below, then use one of
+                the official faucet tools to send test XLM to your account.
               </Text>
+
+              {isWalletConnected && publicKey ? (
+                <>
+                  {/* Public Key Display & Copy */}
+                  <View style={styles.keyCard}>
+                    <Text style={styles.keyLabel}>{t('settings.yourPublicKey')}</Text>
+                    <Text
+                      style={styles.keyValue}
+                      selectable
+                      numberOfLines={1}
+                      ellipsizeMode="middle"
+                    >
+                      {publicKey}
+                    </Text>
+                    <View style={styles.keyActions}>
+                      <Pressable
+                        style={({ pressed }) => [
+                          styles.keyActionButton,
+                          pressed && styles.linkButtonPressed,
+                        ]}
+                        accessibilityRole="button"
+                        accessibilityLabel={
+                          copiedKey ? 'Public key copied' : 'Copy public key to clipboard'
+                        }
+                        accessibilityHint="Copies your Stellar public key for pasting into a faucet"
+                        onPress={() => void copyPublicKey()}
+                      >
+                        <Text style={styles.keyActionText}>
+                          {copiedKey ? '✓ Copied' : 'Copy Key'}
+                        </Text>
+                      </Pressable>
+
+                      <Pressable
+                        style={({ pressed }) => [
+                          styles.keyActionButtonSecondary,
+                          pressed && styles.linkButtonPressed,
+                        ]}
+                        accessibilityRole="link"
+                        accessibilityLabel="View account on Stellar Expert explorer"
+                        accessibilityHint="Opens your account on the Stellar Expert testnet explorer to view your balance and transactions"
+                        onPress={() => void openAccountExplorer()}
+                      >
+                        <Text style={styles.keyActionTextSecondary}>
+                          View in Explorer
+                        </Text>
+                      </Pressable>
+                    </View>
+                  </View>
+
+                  <Text style={styles.faucetHint}>
+                    After funding, use the explorer to verify your balance and
+                    return to the app to continue.
+                  </Text>
+                </>
+              ) : (
+                <Text style={styles.faucetHint}>
+                  Connect your wallet first to see your public key and fund your
+                  account.
+                </Text>
+              )}
 
               <View style={styles.linkGroup}>
                 <Pressable
@@ -298,7 +857,7 @@ export const SettingsScreen: React.FC = () => {
                   accessibilityHint="Opens the official Stellar Lab account funding tool"
                   onPress={() => void openFaucetTool(STELLAR_LAB_FAUCET_URL)}
                 >
-                  <Text style={styles.linkButtonText}>Stellar Lab faucet</Text>
+                  <Text style={styles.linkButtonText}>{t('settings.stellarLabFaucet')}</Text>
                 </Pressable>
 
                 <Pressable
@@ -311,7 +870,7 @@ export const SettingsScreen: React.FC = () => {
                   accessibilityHint="Opens the official Friendbot endpoint for testnet funding"
                   onPress={() => void openFaucetTool(STELLAR_FRIENDBOT_URL)}
                 >
-                  <Text style={styles.secondaryLinkButtonText}>Friendbot API</Text>
+                  <Text style={styles.secondaryLinkButtonText}>{t('settings.friendbotApi')}</Text>
                 </Pressable>
               </View>
             </View>
@@ -343,6 +902,64 @@ const makeStyles = (colors: AppColors) =>
       letterSpacing: 0.8,
       marginBottom: 8,
       marginTop: 20,
+    },
+    sectionHint: {
+      fontSize: 13,
+      color: colors.textSecondary,
+      marginBottom: 12,
+      lineHeight: 18,
+    },
+    languageRow: {
+      flexDirection: 'row',
+      flexWrap: 'wrap',
+      gap: 8,
+      marginBottom: 4,
+    },
+    languageChip: {
+      paddingHorizontal: 14,
+      paddingVertical: 10,
+      borderRadius: 999,
+      borderWidth: 1,
+      borderColor: colors.border,
+      backgroundColor: colors.surface,
+    },
+    languageChipActive: {
+      backgroundColor: colors.primary,
+      borderColor: colors.primary,
+    },
+    languageChipText: {
+      fontSize: 14,
+      fontWeight: '500',
+      color: colors.textPrimary,
+    },
+    languageChipTextActive: {
+      color: '#FFFFFF',
+    },
+    frequencyRow: {
+      flexDirection: 'row',
+      flexWrap: 'wrap',
+      gap: 8,
+      marginBottom: 4,
+    },
+    frequencyChip: {
+      paddingHorizontal: 14,
+      paddingVertical: 10,
+      borderRadius: 999,
+      borderWidth: 1,
+      borderColor: colors.border,
+      backgroundColor: colors.surface,
+    },
+    frequencyChipActive: {
+      backgroundColor: colors.primary,
+      borderColor: colors.primary,
+    },
+    frequencyChipText: {
+      fontSize: 14,
+      fontWeight: '500',
+      color: colors.textPrimary,
+    },
+    frequencyChipTextActive: {
+      color: '#FFFFFF',
     },
     row: {
       flexDirection: 'row',
@@ -384,10 +1001,111 @@ const makeStyles = (colors: AppColors) =>
       borderColor: colors.border,
       gap: 14,
     },
+    cachePanel: {
+      backgroundColor: colors.surface,
+      borderRadius: 14,
+      padding: 16,
+      borderWidth: 1,
+      borderColor: colors.border,
+      gap: 10,
+    },
+    cacheWarning: {
+      backgroundColor: colors.warningBg,
+      borderRadius: 8,
+      color: colors.warning,
+      fontSize: 13,
+      fontWeight: '600',
+      lineHeight: 18,
+      padding: 10,
+    },
+    cacheMetricRow: {
+      alignItems: 'center',
+      flexDirection: 'row',
+      justifyContent: 'space-between',
+      gap: 12,
+    },
+    cacheMetricLabel: {
+      color: colors.textPrimary,
+      fontSize: 14,
+      fontWeight: '600',
+    },
+    cacheMetricValue: {
+      color: colors.textPrimary,
+      fontSize: 14,
+      fontWeight: '700',
+    },
+    cacheMetricHint: {
+      color: colors.textSecondary,
+      fontSize: 12,
+      marginTop: -6,
+    },
     faucetCopy: {
       fontSize: 14,
       color: colors.textSecondary,
       lineHeight: 20,
+    },
+    faucetHint: {
+      fontSize: 13,
+      color: colors.textSecondary,
+      lineHeight: 18,
+      fontStyle: 'italic',
+    },
+    keyCard: {
+      backgroundColor: colors.infoBg,
+      borderRadius: 12,
+      padding: 14,
+      borderWidth: 1,
+      borderColor: colors.border,
+      gap: 10,
+    },
+    keyLabel: {
+      fontSize: 12,
+      fontWeight: '700',
+      color: colors.info,
+      textTransform: 'uppercase',
+      letterSpacing: 0.5,
+    },
+    keyValue: {
+      fontSize: 14,
+      fontWeight: '600',
+      color: colors.textPrimary,
+      fontFamily: 'monospace',
+    },
+    keyActions: {
+      flexDirection: 'row',
+      gap: 10,
+    },
+    keyActionButton: {
+      flex: 1,
+      minHeight: 40,
+      borderRadius: 8,
+      alignItems: 'center',
+      justifyContent: 'center',
+      backgroundColor: colors.brand.primary,
+      paddingHorizontal: 12,
+      paddingVertical: 10,
+    },
+    keyActionButtonSecondary: {
+      flex: 1,
+      minHeight: 40,
+      borderRadius: 8,
+      alignItems: 'center',
+      justifyContent: 'center',
+      backgroundColor: colors.surface,
+      borderWidth: 1,
+      borderColor: colors.border,
+      paddingHorizontal: 12,
+      paddingVertical: 10,
+    },
+    keyActionText: {
+      color: '#FFFFFF',
+      fontSize: 14,
+      fontWeight: '700',
+    },
+    keyActionTextSecondary: {
+      color: colors.info,
+      fontSize: 14,
+      fontWeight: '700',
     },
     linkGroup: {
       gap: 10,
@@ -417,11 +1135,6 @@ const makeStyles = (colors: AppColors) =>
     },
     linkButtonText: {
       color: '#FFFFFF',
-      fontSize: 15,
-      fontWeight: '700',
-    },
-    resetButtonText: {
-      color: colors.brand.primary,
       fontSize: 15,
       fontWeight: '700',
     },

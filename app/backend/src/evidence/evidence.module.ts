@@ -11,10 +11,25 @@ import { EncryptionModule } from '../common/encryption/encryption.module';
 import { AuditModule } from '../audit/audit.module';
 import { CacheModule } from '../common/cache/cache.module';
 import { FingerprintService } from './fingerprint.service';
+import { MetricsModule } from '../observability/metrics/metrics.module';
+import { EvidenceMetricsScheduler } from './evidence-metrics.scheduler';
+import { OrphanedArtifactsService } from './orphaned-artifacts.service';
+import { OrphanedArtifactsScheduler } from './orphaned-artifacts.scheduler';
+import { OrphanedArtifactsController } from './orphaned-artifacts.controller';
 
 @Module({
-  imports: [PrismaModule, EncryptionModule, AuditModule, CacheModule],
-  controllers: [EvidenceController, UploadSessionController],
+  imports: [
+    PrismaModule,
+    EncryptionModule,
+    AuditModule,
+    CacheModule,
+    MetricsModule,
+  ],
+  controllers: [
+    EvidenceController,
+    UploadSessionController,
+    OrphanedArtifactsController,
+  ],
   providers: [
     EvidenceService,
     FingerprintService,
@@ -22,7 +37,14 @@ import { FingerprintService } from './fingerprint.service';
     ArtifactTokenGuard,
     UploadSessionService,
     UploadSessionStore,
+    EvidenceMetricsScheduler,
+    OrphanedArtifactsService,
+    OrphanedArtifactsScheduler,
   ],
-  exports: [FingerprintService, ArtifactOwnershipTokenService],
+  exports: [
+    FingerprintService,
+    ArtifactOwnershipTokenService,
+    OrphanedArtifactsService,
+  ],
 })
 export class EvidenceModule {}

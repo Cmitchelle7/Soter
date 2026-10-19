@@ -10,7 +10,8 @@ import {
   HelpCircle
 } from 'lucide-react';
 import { ERROR_METADATA, ErrorCategory } from '@/types/error';
-import { categorizeError, normalizeError } from '@/lib/error-utils';
+import { normalizeError } from '@/lib/error-utils';
+import { useTranslations } from 'next-intl';
 
 interface ErrorInlineProps {
   error?: Error | string | null;
@@ -27,13 +28,24 @@ export function ErrorInline({
   onClose,
   variant = 'card',
 }: ErrorInlineProps) {
+  const t = useTranslations('errors');
+
   if (!error) return null;
 
   const normalized = normalizeError(error);
   const category = manualCategory || normalized.category;
   const metadata = ERROR_METADATA[category];
   
-  const errorMessage = normalized.message;
+  let errorMessage = t('generic');
+
+if (normalized.code && t.has(normalized.code)) {
+  errorMessage = t(normalized.code);
+} else if (!normalized.code && normalized.message) {
+  errorMessage = normalized.message;
+} else if (normalized.code) {
+  console.warn(`[ErrorInline] Unknown error code: ${normalized.code}`);
+}
+  
   const correlationId = normalized.correlationId;
 
   const getCategoryIcon = () => {

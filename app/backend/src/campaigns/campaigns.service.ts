@@ -1,8 +1,5 @@
-import {
-  Injectable,
-  NotFoundException,
-  BadRequestException,
-} from '@nestjs/common';
+import { AppException, ERROR_CODES } from '../common/dto/error-response.dto';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import {
   CampaignStatus,
   ClaimStatus,
@@ -13,6 +10,9 @@ import { PrismaService } from '../prisma/prisma.service';
 import { CreateCampaignDto } from './dto/create-campaign.dto';
 import { UpdateCampaignDto } from './dto/update-campaign.dto';
 import { ExportCampaignsQueryDto } from './dto/export-campaigns.dto';
+import { escapeCsvField, toCsvRow } from '../common/csv/csv.util';
+import { streamCursorPaginated } from '../common/streaming/cursor-paginate';
+import { AnalyticsService } from '../analytics/analytics.service';
 
 export interface CampaignExportRow {
   id: string;
@@ -28,11 +28,19 @@ export interface CampaignExportRow {
   totalDisbursed: number;
 }
 
-export interface CampaignExportResult {
-  data: CampaignExportRow[];
-  total: number;
-  page: number;
-  limit: number;
+interface RawCampaignExportRow {
+  id: string;
+  name: string;
+  status: CampaignStatus;
+  budget: number;
+  orgId: string | null;
+  ngoId: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+  archivedAt: Date | null;
+  deletedAt: Date | null;
+  _count: { claims: number };
+  balanceLedger: Array<{ amount: number }>;
 }
 
 export interface CampaignTimelineMilestone {
@@ -48,7 +56,22 @@ export interface CampaignTimelineMilestone {
 
 @Injectable()
 export class CampaignsService {
-  constructor(private readonly prisma: PrismaService) {}
+  private readonly logger = new Logger(CampaignsService.name);
+
+  constructor(
+    private readonly prisma: PrismaService,
+    @Optional() private readonly analyticsService?: AnalyticsService,
+  ) {}
+
+  private async invalidateDashboardSummary(reason: string) {
+    try {
+      await this.analyticsService?.invalidateCache(reason);
+    } catch (error) {
+      this.logger.warn(
+        `Failed to invalidate dashboard summary cache after ${reason}: ${String(error)}`,
+      );
+    }
+  }
 
   private sanitizeMetadata(
     metadata?: Record<string, unknown>,
@@ -58,7 +81,7 @@ export class CampaignsService {
   }
 
   async create(dto: CreateCampaignDto, ngoId?: string | null) {
-    return this.prisma.campaign.create({
+    const created = await this.prisma.campaign.create({
       data: {
         name: dto.name,
         status: dto.status ?? CampaignStatus.draft,
@@ -67,6 +90,9 @@ export class CampaignsService {
         ngoId: ngoId ?? null,
       },
     });
+
+    await this.invalidateDashboardSummary('campaign_updated');
+    return created;
   }
 
   async findAll(includeArchived = false, ngoId?: string | null) {
@@ -87,7 +113,7 @@ export class CampaignsService {
       where: { id },
     });
     if (!campaign || (campaign as { deletedAt?: Date | null }).deletedAt) {
-      throw new NotFoundException('Campaign not found');
+      throw new AppException(ERROR_CODES.NOT_FOUND, 404, 'Campaign not found');
     }
     return campaign;
   }
@@ -108,7 +134,7 @@ export class CampaignsService {
     });
 
     if (!campaign || campaign.deletedAt) {
-      throw new NotFoundException('Campaign not found');
+      throw new AppException(ERROR_CODES.NOT_FOUND, 404, 'Campaign not found');
     }
 
     const allTransactions = campaign.claims.flatMap(claim =>
@@ -207,7 +233,7 @@ export class CampaignsService {
   async update(id: string, dto: UpdateCampaignDto) {
     await this.findOne(id);
 
-    return this.prisma.campaign.update({
+    const updated = await this.prisma.campaign.update({
       where: { id },
       data: {
         name: dto.name,
@@ -219,6 +245,9 @@ export class CampaignsService {
             : this.sanitizeMetadata(dto.metadata),
       },
     });
+
+    await this.invalidateDashboardSummary('campaign_updated');
+    return updated;
   }
 
   private latestTransaction<
@@ -269,25 +298,31 @@ export class CampaignsService {
       data: { archivedAt: new Date(), status: CampaignStatus.archived },
     });
 
+    await this.invalidateDashboardSummary('campaign_updated');
     return { campaign: updated, alreadyArchived: false };
   }
 
   /** Soft-delete a campaign (sets deletedAt). */
   async softDelete(id: string) {
     await this.findOne(id);
-    return this.prisma.campaign.update({
+    const deleted = await this.prisma.campaign.update({
       where: { id },
       data: { deletedAt: new Date() },
     });
+
+    await this.invalidateDashboardSummary('campaign_updated');
+    return deleted;
   }
 
-  async exportCampaigns(
-    query: ExportCampaignsQueryDto,
-  ): Promise<CampaignExportResult> {
-    const page = Math.max(1, query.page ?? 1);
-    const limit = Math.min(200, Math.max(1, query.limit ?? 50));
-    const skip = (page - 1) * limit;
+  /** Batch size used when streaming exports; bounds memory to O(batch), not O(total rows). */
+  private static readonly EXPORT_BATCH_SIZE = 500;
 
+  private static readonly CSV_HEADER =
+    'id,name,status,budget,orgId,ngoId,createdAt,updatedAt,archivedAt,totalClaims,totalDisbursed';
+
+  private buildExportWhere(
+    query: ExportCampaignsQueryDto,
+  ): Prisma.CampaignWhereInput {
     const where: Prisma.CampaignWhereInput = {
       deletedAt: null,
     };
@@ -298,52 +333,29 @@ export class CampaignsService {
 
     if (query.from || query.to) {
       if (query.from && isNaN(Date.parse(query.from))) {
-        throw new BadRequestException(`Invalid 'from' date: ${query.from}`);
+        throw new AppException(
+          ERROR_CODES.BAD_REQUEST,
+          400,
+          `Invalid 'from' date: ${query.from}`,
+        );
       }
       if (query.to && isNaN(Date.parse(query.to))) {
-        throw new BadRequestException(`Invalid 'to' date: ${query.to}`);
+        throw new AppException(
+          ERROR_CODES.BAD_REQUEST,
+          400,
+          `Invalid 'to' date: ${query.to}`,
+        );
       }
       where.createdAt = {};
       if (query.from) where.createdAt.gte = new Date(query.from);
       if (query.to) where.createdAt.lte = new Date(query.to);
     }
 
-    const [campaignsResult, total] = await this.prisma.$transaction([
-      this.prisma.campaign.findMany({
-        where,
-        orderBy: { createdAt: 'desc' },
-        skip,
-        take: limit,
-        include: {
-          _count: {
-            select: { claims: true },
-          },
-          balanceLedger: {
-            where: { eventType: 'disburse' },
-          },
-        },
-      }),
-      this.prisma.campaign.count({ where }),
-    ]);
+    return where;
+  }
 
-    // Use type assertion to handle Prisma client type limitations
-    // Prisma schema has these fields but generated types may be stale
-    const campaigns = campaignsResult as unknown as Array<{
-      id: string;
-      name: string;
-      status: CampaignStatus;
-      budget: number;
-      orgId: string | null;
-      ngoId: string | null;
-      createdAt: Date;
-      updatedAt: Date;
-      archivedAt: Date | null;
-      deletedAt: Date | null;
-      _count: { claims: number };
-      balanceLedger: Array<{ amount: number }>;
-    }>;
-
-    const data: CampaignExportRow[] = campaigns.map(c => ({
+  private mapCampaignRow(c: RawCampaignExportRow): CampaignExportRow {
+    return {
       id: c.id,
       name: c.name,
       status: c.status,
@@ -355,35 +367,64 @@ export class CampaignsService {
       archivedAt: c.archivedAt ?? null,
       totalClaims: c._count.claims,
       totalDisbursed: c.balanceLedger.reduce((sum, bl) => sum + bl.amount, 0),
-    }));
-
-    return { data, total, page, limit };
+    };
   }
 
-  buildCsv(rows: CampaignExportRow[]): string {
-    const escape = (value: string | number | null): string => {
-      const str = String(value ?? '').replace(/"/g, '""');
-      return `"${str}"`;
-    };
+  /** Count of campaigns matching the export filters, for the X-Total-Count header. */
+  async countExport(query: ExportCampaignsQueryDto): Promise<number> {
+    return this.prisma.campaign.count({ where: this.buildExportWhere(query) });
+  }
 
-    const header =
-      'id,name,status,budget,orgId,ngoId,createdAt,updatedAt,archivedAt,totalClaims,totalDisbursed';
-    const lines = rows.map(r =>
-      [
-        escape(r.id),
-        escape(r.name),
-        escape(r.status),
-        escape(r.budget),
-        escape(r.orgId),
-        escape(r.ngoId),
-        escape(r.createdAt.toISOString()),
-        escape(r.updatedAt.toISOString()),
-        escape(r.archivedAt?.toISOString() ?? ''),
-        escape(r.totalClaims),
-        escape(r.totalDisbursed.toFixed(2)),
-      ].join(','),
-    );
+  /**
+   * Streams campaign export rows using cursor-based pagination, fetching one
+   * bounded batch at a time instead of loading the full matching set into
+   * memory. See CampaignsController#exportCampaigns for how this is piped
+   * directly into the HTTP response.
+   */
+  async *streamExportRows(
+    query: ExportCampaignsQueryDto,
+  ): AsyncGenerator<CampaignExportRow> {
+    const where = this.buildExportWhere(query);
+    const batchSize = CampaignsService.EXPORT_BATCH_SIZE;
 
-    return [header, ...lines].join('\r\n');
+    const fetchPage = (cursor: string | undefined) =>
+      this.prisma.campaign.findMany({
+        where,
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        take: batchSize,
+        ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+        include: {
+          _count: { select: { claims: true } },
+          balanceLedger: { where: { eventType: 'disburse' } },
+        },
+        // Prisma schema has these fields but generated types may be stale.
+      }) as unknown as Promise<RawCampaignExportRow[]>;
+
+    for await (const row of streamCursorPaginated(fetchPage, batchSize)) {
+      yield this.mapCampaignRow(row);
+    }
+  }
+
+  /** Streams the export as CSV text chunks: header first, then one line per row. */
+  async *streamExportCsv(
+    query: ExportCampaignsQueryDto,
+  ): AsyncGenerator<string> {
+    yield CampaignsService.CSV_HEADER + '\r\n';
+
+    for await (const row of this.streamExportRows(query)) {
+      yield toCsvRow([
+        escapeCsvField(row.id),
+        escapeCsvField(row.name),
+        escapeCsvField(row.status),
+        escapeCsvField(row.budget),
+        escapeCsvField(row.orgId),
+        escapeCsvField(row.ngoId),
+        escapeCsvField(row.createdAt.toISOString()),
+        escapeCsvField(row.updatedAt.toISOString()),
+        escapeCsvField(row.archivedAt?.toISOString() ?? ''),
+        escapeCsvField(row.totalClaims),
+        escapeCsvField(row.totalDisbursed.toFixed(2)),
+      ]);
+    }
   }
 }

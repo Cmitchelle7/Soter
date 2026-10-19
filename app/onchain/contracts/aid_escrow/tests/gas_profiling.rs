@@ -1,6 +1,9 @@
 #![cfg(test)]
 
+use std::path::Path;
+
 use aid_escrow::{AidEscrow, AidEscrowClient, Config};
+use serde_json::json;
 use soroban_sdk::{
     testutils::{Address as _, Ledger, LedgerInfo},
     token::StellarAssetClient,
@@ -56,6 +59,7 @@ impl TestSetup {
             min_amount: 1,
             max_expires_in: 0,
             allowed_tokens: Vec::new(&env),
+            claim_cooldown: 0,
         });
 
         Self {
@@ -110,8 +114,92 @@ fn print_budget_metrics(operation: &str, metrics: &BudgetMetrics) {
     println!();
 }
 
+// ---------------------------------------------------------------------------
+// Budget gate artifacts + deliberate budget updates
+// ---------------------------------------------------------------------------
+
+/// Artifacts are written into the workspace `target` dir so they are gitignored
+/// and discoverable by the CI budget-gate script (`scripts/check_gas_budgets.py`).
+fn metrics_dir() -> std::path::PathBuf {
+    // CARGO_MANIFEST_DIR is the package dir (app/onchain/contracts/aid_escrow);
+    // walk up two levels to the workspace (app/onchain) and into its target.
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("target/gas_metrics")
+}
+
+/// Persist a measured cost for one entry point so the CI budget-gate can
+/// compare it against the committed budgets in `gas_budgets.json`.
+fn record_metrics(operation: &str, size: u32, metrics: &BudgetMetrics) {
+    let dir = metrics_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let file_name = format!("{}.json", operation);
+    let record = json!({
+        "operation": operation,
+        "size": size,
+        "cpu_instructions": metrics.cpu_instructions,
+        "memory_bytes": metrics.memory_bytes,
+    });
+    if let Ok(contents) = serde_json::to_string_pretty(&record) {
+        let _ = std::fs::write(dir.join(file_name), contents);
+    }
+    maybe_update_budgets(operation, metrics);
+}
+
+/// When `SOTER_UPDATE_GAS_BUDGETS=1` is set, rewrite `gas_budgets.json` with
+/// the just-measured values. This is the deliberate, reviewable way to bump a
+/// budget after an intentional cost change (commit the result in a reviewed PR).
+fn maybe_update_budgets(operation: &str, metrics: &BudgetMetrics) {
+    if std::env::var("SOTER_UPDATE_GAS_BUDGETS").is_err() {
+        return;
+    }
+    let budgets_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("gas_budgets.json");
+    let mut budgets: serde_json::Value = if budgets_path.exists() {
+        serde_json::from_str(&std::fs::read_to_string(&budgets_path).unwrap_or_default())
+            .unwrap_or_else(|_| json!({ "tolerance": default_tolerance(), "budgets": {} }))
+    } else {
+        json!({ "tolerance": default_tolerance(), "budgets": {} })
+    };
+    budgets["budgets"][operation] = json!({
+        "cpu_instructions": metrics.cpu_instructions,
+        "memory_bytes": metrics.memory_bytes,
+    });
+    if let Ok(contents) = serde_json::to_string_pretty(&budgets) {
+        let _ = std::fs::write(&budgets_path, contents);
+    }
+}
+
+fn default_tolerance() -> serde_json::Value {
+    json!({ "cpu_instructions_pct": 15, "memory_bytes_pct": 15 })
+}
+
 fn new_metadata(env: &Env) -> Map<Symbol, soroban_sdk::String> {
     Map::new(env)
+}
+
+fn create_profiled_package(t: &TestSetup, id: u64, recipient: &Address) {
+    t.fund_contract(ONE_TOKEN);
+    let expires_at = t.now() + 3_600;
+    t.client.create_package(
+        &t.admin,
+        &id,
+        recipient,
+        &ONE_TOKEN,
+        &t.token,
+        &expires_at,
+        &new_metadata(&t.env),
+    );
+}
+
+fn profile_ids(t: &TestSetup, count: u64) -> Vec<u64> {
+    let mut ids: Vec<u64> = Vec::new(&t.env);
+    for id in 1..=count {
+        ids.push_back(id);
+    }
+    ids
 }
 
 // ===========================================================================
@@ -143,6 +231,7 @@ fn profile_single_create_package() {
     let metrics = diff_budget(&before, &after);
 
     print_budget_metrics("Single create_package", &metrics);
+    record_metrics("create_package", 1, &metrics);
 }
 
 #[test]
@@ -169,6 +258,7 @@ fn profile_single_claim() {
     let metrics = diff_budget(&before, &after);
 
     print_budget_metrics("Single claim", &metrics);
+    record_metrics("claim", 1, &metrics);
 }
 
 #[test]
@@ -197,6 +287,160 @@ fn profile_single_refund() {
     let metrics = diff_budget(&before, &after);
 
     print_budget_metrics("Single refund", &metrics);
+    record_metrics("refund", 1, &metrics);
+}
+
+// ---------------------------------------------------------------------------
+// Delegate operations
+// ---------------------------------------------------------------------------
+
+#[test]
+fn profile_single_set_delegate() {
+    let t = TestSetup::new();
+    let recipient = Address::generate(&t.env);
+    let delegate = Address::generate(&t.env);
+    create_profiled_package(&t, 1, &recipient);
+
+    let before = capture_budget(&t.env);
+    t.client.set_delegate(&t.admin, &1u64, &delegate);
+    let after = capture_budget(&t.env);
+    let metrics = diff_budget(&before, &after);
+
+    print_budget_metrics("Single set_delegate", &metrics);
+    record_metrics("set_delegate", 1, &metrics);
+}
+
+#[test]
+fn profile_single_set_delegate_with_expiry() {
+    let t = TestSetup::new();
+    let recipient = Address::generate(&t.env);
+    let delegate = Address::generate(&t.env);
+    create_profiled_package(&t, 1, &recipient);
+
+    let before = capture_budget(&t.env);
+    t.client
+        .set_delegate_with_expiry(&t.admin, &1u64, &delegate, &(t.now() + 3_600));
+    let after = capture_budget(&t.env);
+    let metrics = diff_budget(&before, &after);
+
+    print_budget_metrics("Single set_delegate_with_expiry", &metrics);
+    record_metrics("set_delegate_with_expiry", 1, &metrics);
+}
+
+#[test]
+fn profile_single_revoke_delegate() {
+    let t = TestSetup::new();
+    let recipient = Address::generate(&t.env);
+    let delegate = Address::generate(&t.env);
+    create_profiled_package(&t, 1, &recipient);
+    t.client.set_delegate(&t.admin, &1u64, &delegate);
+
+    let before = capture_budget(&t.env);
+    t.client.revoke_delegate(&t.admin, &1u64);
+    let after = capture_budget(&t.env);
+    let metrics = diff_budget(&before, &after);
+
+    print_budget_metrics("Single revoke_delegate", &metrics);
+    record_metrics("revoke_delegate", 1, &metrics);
+}
+
+#[test]
+fn profile_get_delegate() {
+    let t = TestSetup::new();
+    let recipient = Address::generate(&t.env);
+    let delegate = Address::generate(&t.env);
+    create_profiled_package(&t, 1, &recipient);
+    t.client.set_delegate(&t.admin, &1u64, &delegate);
+
+    let before = capture_budget(&t.env);
+    let _delegate = t.client.get_delegate(&1u64);
+    let after = capture_budget(&t.env);
+    let metrics = diff_budget(&before, &after);
+
+    print_budget_metrics("Get delegate", &metrics);
+    record_metrics("get_delegate", 1, &metrics);
+}
+
+#[test]
+fn profile_get_delegate_info() {
+    let t = TestSetup::new();
+    let recipient = Address::generate(&t.env);
+    let delegate = Address::generate(&t.env);
+    create_profiled_package(&t, 1, &recipient);
+    t.client.set_delegate(&t.admin, &1u64, &delegate);
+
+    let before = capture_budget(&t.env);
+    let _info = t.client.get_delegate_info(&1u64);
+    let after = capture_budget(&t.env);
+    let metrics = diff_budget(&before, &after);
+
+    print_budget_metrics("Get delegate info", &metrics);
+    record_metrics("get_delegate_info", 1, &metrics);
+}
+
+#[test]
+fn profile_get_delegate_history() {
+    let t = TestSetup::new();
+    let recipient = Address::generate(&t.env);
+    let delegate = Address::generate(&t.env);
+    let delegate2 = Address::generate(&t.env);
+    create_profiled_package(&t, 1, &recipient);
+    t.client.set_delegate(&t.admin, &1u64, &delegate);
+    t.client.set_delegate(&t.admin, &1u64, &delegate2);
+
+    let before = capture_budget(&t.env);
+    let _history = t.client.get_delegate_history(&1u64);
+    let after = capture_budget(&t.env);
+    let metrics = diff_budget(&before, &after);
+
+    print_budget_metrics("Get delegate history", &metrics);
+    record_metrics("get_delegate_history", 1, &metrics);
+}
+
+#[test]
+fn profile_sweep_expired_delegates() {
+    let t = TestSetup::new();
+
+    for id in 1..=10u64 {
+        let recipient = Address::generate(&t.env);
+        let delegate = Address::generate(&t.env);
+        create_profiled_package(&t, id, &recipient);
+        t.client
+            .set_delegate_with_expiry(&t.admin, &id, &delegate, &(t.now() + 1));
+    }
+
+    t.env.ledger().with_mut(|li| li.timestamp += 2);
+
+    let before = capture_budget(&t.env);
+    let _swept = t.client.sweep_expired_delegates(&10u32);
+    let after = capture_budget(&t.env);
+    let metrics = diff_budget(&before, &after);
+
+    print_budget_metrics("Sweep expired delegates (limit: 10)", &metrics);
+    record_metrics("sweep_expired_delegates", 1, &metrics);
+}
+
+#[test]
+fn profile_cleanup_expired_delegates() {
+    let t = TestSetup::new();
+
+    for id in 1..=10u64 {
+        let recipient = Address::generate(&t.env);
+        let delegate = Address::generate(&t.env);
+        create_profiled_package(&t, id, &recipient);
+        t.client
+            .set_delegate_with_expiry(&t.admin, &id, &delegate, &(t.now() + 1));
+    }
+
+    t.env.ledger().with_mut(|li| li.timestamp += 2);
+
+    let before = capture_budget(&t.env);
+    let _cleaned = t.client.cleanup_expired_delegates(&t.admin);
+    let after = capture_budget(&t.env);
+    let metrics = diff_budget(&before, &after);
+
+    print_budget_metrics("Cleanup expired delegates (10)", &metrics);
+    record_metrics("cleanup_expired_delegates", 1, &metrics);
 }
 
 #[test]
@@ -259,6 +503,74 @@ fn profile_batch_create(batch_size: u32) {
     println!("  Per-package CPU: {}", per_package_cpu);
     println!("  Per-package Memory: {}", per_package_memory);
     println!();
+
+    record_metrics(
+        &format!("batch_create_packages_{}", batch_size),
+        batch_size,
+        &metrics,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Batch claim / revoke / refund (bounded at MAX size 25)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn profile_batch_claim_25() {
+    let t = TestSetup::new();
+    let recipient = Address::generate(&t.env);
+
+    for id in 1..=25u64 {
+        create_profiled_package(&t, id, &recipient);
+    }
+    let ids = profile_ids(&t, 25);
+
+    let before = capture_budget(&t.env);
+    let _results = t.client.batch_claim(&recipient, &ids);
+    let after = capture_budget(&t.env);
+    let metrics = diff_budget(&before, &after);
+
+    print_budget_metrics("Batch claim (size: 25)", &metrics);
+    record_metrics("batch_claim_25", 25, &metrics);
+}
+
+#[test]
+fn profile_batch_revoke_25() {
+    let t = TestSetup::new();
+    let recipient = Address::generate(&t.env);
+
+    for id in 1..=25u64 {
+        create_profiled_package(&t, id, &recipient);
+    }
+    let ids = profile_ids(&t, 25);
+
+    let before = capture_budget(&t.env);
+    let _results = t.client.batch_revoke(&ids);
+    let after = capture_budget(&t.env);
+    let metrics = diff_budget(&before, &after);
+
+    print_budget_metrics("Batch revoke (size: 25)", &metrics);
+    record_metrics("batch_revoke_25", 25, &metrics);
+}
+
+#[test]
+fn profile_batch_refund_25() {
+    let t = TestSetup::new();
+    let recipient = Address::generate(&t.env);
+
+    for id in 1..=25u64 {
+        create_profiled_package(&t, id, &recipient);
+    }
+    t.env.ledger().with_mut(|li| li.timestamp += 3_601);
+    let ids = profile_ids(&t, 25);
+
+    let before = capture_budget(&t.env);
+    let _results = t.client.batch_refund(&ids);
+    let after = capture_budget(&t.env);
+    let metrics = diff_budget(&before, &after);
+
+    print_budget_metrics("Batch refund (size: 25)", &metrics);
+    record_metrics("batch_refund_25", 25, &metrics);
 }
 
 #[test]
@@ -310,6 +622,7 @@ fn profile_claim_with_proof() {
     let metrics = diff_budget(&before, &after);
 
     print_budget_metrics("Claim with Merkle proof", &metrics);
+    record_metrics("claim_with_proof", 1, &metrics);
 }
 
 #[test]
@@ -324,6 +637,7 @@ fn profile_fund_operation() {
     let metrics = diff_budget(&before, &after);
 
     print_budget_metrics("Fund operation (1 token)", &metrics);
+    record_metrics("fund", 1, &metrics);
 }
 
 #[test]
@@ -350,6 +664,7 @@ fn profile_get_package() {
     let metrics = diff_budget(&before, &after);
 
     print_budget_metrics("Get package", &metrics);
+    record_metrics("get_package", 1, &metrics);
 }
 
 #[test]
@@ -382,4 +697,5 @@ fn profile_get_aggregates() {
         &format!("Get aggregates ({} packages)", batch_size),
         &metrics,
     );
+    record_metrics("get_aggregates", 1, &metrics);
 }

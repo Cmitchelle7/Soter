@@ -1,10 +1,12 @@
-import { Injectable, BadRequestException } from '@nestjs/common';
+import { AppException, ERROR_CODES } from '../common/dto/error-response.dto';
+import { Injectable } from '@nestjs/common';
 import { createHash } from 'crypto';
 import { Type } from 'class-transformer';
 import { IsInt, IsISO8601, IsOptional, IsString, Max, Min } from 'class-validator';
 import { PrismaService } from '../prisma/prisma.service';
 import { Prisma } from '@prisma/client';
 import { MetricsService } from 'src/audit/metrics.service';
+import { AuditChainService } from './audit-chain.service';
 
 export interface AuditLogParams {
   actorId: string;
@@ -86,6 +88,7 @@ export class AuditService {
   constructor(
     private prisma: PrismaService,
     private metrics: MetricsService,
+    private chain: AuditChainService,
   ) {}
 
   anonymize(value: string): string {
@@ -98,15 +101,11 @@ export class AuditService {
       entity: 'AuditLog',
     });
     try {
-      const result = await this.prisma.auditLog.create({
-        data: {
-          actorId: params.actorId,
-          entity: params.entity,
-          entityId: params.entityId,
-          action: params.action,
-          metadata: (params.metadata as Prisma.InputJsonValue) ?? {},
-        },
-      });
+      // Appends are hash-chained (tamper-evident); see
+      // docs/audit-log-integrity.md. The chain service serializes concurrent
+      // appends with a Postgres advisory lock and assigns the entry's
+      // sequence, prevHash and entryHash atomically.
+      const result = await this.chain.appendToChain(params);
       end();
       return result;
     } catch (error) {
@@ -196,10 +195,18 @@ export class AuditService {
 
     if (query.from || query.to) {
       if (query.from && isNaN(Date.parse(query.from))) {
-        throw new BadRequestException(`Invalid 'from' date: ${query.from}`);
+        throw new AppException(
+          ERROR_CODES.BAD_REQUEST,
+          400,
+          `Invalid 'from' date: ${query.from}`,
+        );
       }
       if (query.to && isNaN(Date.parse(query.to))) {
-        throw new BadRequestException(`Invalid 'to' date: ${query.to}`);
+        throw new AppException(
+          ERROR_CODES.BAD_REQUEST,
+          400,
+          `Invalid 'to' date: ${query.to}`,
+        );
       }
       where.timestamp = {};
       if (query.from) where.timestamp.gte = new Date(query.from);

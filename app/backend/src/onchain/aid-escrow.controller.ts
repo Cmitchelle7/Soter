@@ -1,3 +1,4 @@
+import { AppException, ERROR_CODES } from '../common/dto/error-response.dto';
 import {
   Controller,
   Post,
@@ -8,7 +9,6 @@ import {
   HttpStatus,
   Req,
   Query,
-  BadRequestException,
   Logger,
 } from '@nestjs/common';
 import { Request } from 'express';
@@ -28,7 +28,12 @@ import {
   CreateAidPackageDto,
   BatchCreateAidPackagesDto,
   DryRunAidPackageResultDto,
+  ExtendAidPackageExpiryDto,
+  SetDelegateDto,
 } from './dto/aid-escrow.dto';
+import { CONTRACT_ERROR_CATALOG } from './utils/contract-error-catalog';
+import { Roles } from '../auth/roles.decorator';
+import { AppRole } from '../auth/app-role.enum';
 import { SorobanErrorMapper } from './utils/soroban-error.mapper';
 import { CacheResponse } from '../common/decorators/cache-response.decorator';
 import { getCacheTTL } from '../common/config/cache.config';
@@ -42,6 +47,20 @@ import { SorobanEventCorrelationService } from './soroban-event-correlation.serv
 @ApiBearerAuth('JWT-auth')
 @Controller('onchain/aid-escrow')
 export class AidEscrowController {
+  private requireUserAddress(
+    req: Request & { user?: { address?: string } },
+  ): string {
+    const address = req.user?.address;
+    if (!address) {
+      throw new AppException(
+        ERROR_CODES.BAD_REQUEST,
+        400,
+        'Recipient address is required',
+      );
+    }
+    return address;
+  }
+
   private readonly logger = new Logger(AidEscrowController.name);
   private readonly errorMapper = new SorobanErrorMapper();
 
@@ -88,7 +107,7 @@ export class AidEscrowController {
     try {
       const operatorAddress = req.user?.address || 'admin';
       return await this.aidEscrowService.createAidPackage(dto, operatorAddress);
-    } catch (error) {
+    } catch (error: unknown) {
       this.logger.error('Failed to create aid package:', error);
       this.errorMapper.throwMappedError(error);
     }
@@ -123,7 +142,7 @@ export class AidEscrowController {
         dto,
         operatorAddress,
       );
-    } catch (error) {
+    } catch (error: unknown) {
       this.logger.error('Failed to dry-run aid package issuance:', error);
       this.errorMapper.throwMappedError(error);
       throw error;
@@ -168,7 +187,9 @@ export class AidEscrowController {
     @Req() req: Request & { user?: { address?: string } },
   ): Promise<any> {
     if (dto.recipientAddresses.length !== dto.amounts.length) {
-      throw new BadRequestException(
+      throw new AppException(
+        ERROR_CODES.BAD_REQUEST,
+        400,
         'Recipients and amounts arrays must have the same length',
       );
     }
@@ -179,7 +200,7 @@ export class AidEscrowController {
         dto,
         operatorAddress,
       );
-    } catch (error) {
+    } catch (error: unknown) {
       this.logger.error('Failed to batch create aid packages:', error);
       this.errorMapper.throwMappedError(error);
     }
@@ -224,7 +245,11 @@ export class AidEscrowController {
   ): Promise<any> {
     const recipientAddress = req.user?.address;
     if (!recipientAddress) {
-      throw new BadRequestException('Recipient address required');
+      throw new AppException(
+        ERROR_CODES.BAD_REQUEST,
+        400,
+        'Recipient address required',
+      );
     }
 
     try {
@@ -232,7 +257,7 @@ export class AidEscrowController {
         { packageId },
         recipientAddress,
       );
-    } catch (error) {
+    } catch (error: unknown) {
       this.logger.error('Failed to claim aid package:', error);
       this.errorMapper.throwMappedError(error);
     }
@@ -283,8 +308,63 @@ export class AidEscrowController {
         { packageId },
         operatorAddress,
       );
-    } catch (error) {
+    } catch (error: unknown) {
       this.logger.error('Failed to disburse aid package:', error);
+      this.errorMapper.throwMappedError(error);
+    }
+  }
+
+  /**
+   * Extend the expiration of an aid package (operator/admin action)
+   * POST /onchain/aid-escrow/packages/:id/extend-expiry
+   * POST /onchain/aid-escrow/packages/:id/extend
+   */
+  @Post(['packages/:id/extend-expiry', 'packages/:id/extend'])
+  @Roles(AppRole.operator, AppRole.admin)
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Extend aid package expiry',
+    description:
+      'Extends the expiration timestamp of an active aid package using an absolute timestamp (canonical extend_expiry convention). Only authorized operators or admins can extend package expiry.',
+  })
+  @ApiOkResponse({
+    description: 'Package expiry extended successfully.',
+    schema: {
+      example: {
+        packageId: 'pkg_123456789',
+        transactionHash:
+          'ABC123DEF456ABC123DEF456ABC123DEF456ABC123DEF456ABC123DEF456ABCD',
+        timestamp: '2026-03-30T12:30:00.000Z',
+        status: 'success',
+        oldExpiresAt: 1714406400,
+        newExpiresAt: 1717084800,
+        metadata: {
+          operator: 'GBUQWP3BOUZX34ULNQG23RQ6F4BFXWBTRSE53XSTE23JMCVOCJGXVSVZ',
+        },
+      },
+    },
+  })
+  @ApiBadRequestResponse({
+    description:
+      'Package is not active (already claimed or expired) or invalid timestamp.',
+  })
+  @ApiNotFoundResponse({ description: 'Package does not exist.' })
+  @ApiInternalServerErrorResponse({
+    description: 'Blockchain transaction failed.',
+  })
+  async extendAidPackageExpiry(
+    @Param('id') packageId: string,
+    @Body() dto: ExtendAidPackageExpiryDto,
+    @Req() req: Request & { user?: { address?: string; id?: string } },
+  ): Promise<any> {
+    try {
+      const operatorAddress = req.user?.address || req.user?.id || 'admin';
+      return await this.aidEscrowService.extendAidPackageExpiry(
+        { ...dto, packageId },
+        operatorAddress,
+      );
+    } catch (error) {
+      this.logger.error('Failed to extend aid package expiry:', error);
       this.errorMapper.throwMappedError(error);
     }
   }
@@ -328,7 +408,7 @@ export class AidEscrowController {
   async getAidPackage(@Param('id') packageId: string): Promise<any> {
     try {
       return await this.aidEscrowService.getAidPackage({ packageId });
-    } catch (error) {
+    } catch (error: unknown) {
       this.logger.error('Failed to get aid package:', error);
       this.errorMapper.throwMappedError(error);
     }
@@ -372,7 +452,7 @@ export class AidEscrowController {
       return await this.aidEscrowService.getAidPackageStats({
         tokenAddress: defaultTokenAddress,
       });
-    } catch (error) {
+    } catch (error: unknown) {
       this.logger.error('Failed to get aid package stats:', error);
       this.errorMapper.throwMappedError(error);
     }
@@ -408,11 +488,15 @@ export class AidEscrowController {
   })
   async getTransactionStatus(@Param('hash') hash: string): Promise<any> {
     if (!hash || hash.length < 10) {
-      throw new BadRequestException('Invalid transaction hash');
+      throw new AppException(
+        ERROR_CODES.BAD_REQUEST,
+        400,
+        'Invalid transaction hash',
+      );
     }
     try {
       return await this.aidEscrowService.getTransactionStatus(hash);
-    } catch (error) {
+    } catch (error: unknown) {
       this.logger.error('Failed to get transaction status:', error);
       this.errorMapper.throwMappedError(error);
     }
@@ -463,7 +547,7 @@ export class AidEscrowController {
         events,
         total: events.length,
       };
-    } catch (error) {
+    } catch (error: unknown) {
       this.logger.error('Failed to get package events:', error);
       this.errorMapper.throwMappedError(error);
     }
@@ -505,14 +589,18 @@ export class AidEscrowController {
   })
   async correlateTransaction(@Param('txHash') txHash: string): Promise<any> {
     if (!txHash || txHash.length < 10) {
-      throw new BadRequestException('Invalid transaction hash');
+      throw new AppException(
+        ERROR_CODES.BAD_REQUEST,
+        400,
+        'Invalid transaction hash',
+      );
     }
     try {
       return await this.eventCorrelationService.correlateTransaction(
         txHash,
         'on_demand',
       );
-    } catch (error) {
+    } catch (error: unknown) {
       this.logger.error('Failed to correlate transaction:', error);
       this.errorMapper.throwMappedError(error);
     }
@@ -586,8 +674,231 @@ export class AidEscrowController {
         startLedger,
         endLedger,
       });
-    } catch (error) {
+    } catch (error: unknown) {
       this.logger.error('Failed to get event correlations:', error);
+      this.errorMapper.throwMappedError(error);
+    }
+  }
+
+  /**
+   * Get contract error code catalog
+   * GET /onchain/aid-escrow/error-catalog
+   */
+  @Get('error-catalog')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Get contract error code catalog',
+    description:
+      'Returns the complete catalog of AidEscrow contract error codes with their meanings, retryable status, and HTTP status codes. This is the single source of truth for contract error definitions.',
+  })
+  @ApiOkResponse({
+    description: 'Contract error catalog retrieved successfully.',
+    schema: {
+      example: {
+        errors: [
+          {
+            code: 1,
+            name: 'NotInitialized',
+            meaning: 'Escrow not initialized',
+            retryable: false,
+            httpStatusCode: 400,
+            integrationErrorCode: 'ONCHAIN_CONTRACT_ERROR',
+          },
+          {
+            code: 14,
+            name: 'ContractPaused',
+            meaning: 'Contract is paused',
+            retryable: true,
+            httpStatusCode: 503,
+            integrationErrorCode: 'ONCHAIN_CONTRACT_PAUSED',
+          },
+        ],
+        total: 28,
+      },
+    },
+  })
+  @CacheResponse({ ttl: getCacheTTL().CONTRACT_ERROR_CATALOG })
+  getErrorCatalog() {
+    return {
+      errors: CONTRACT_ERROR_CATALOG,
+      total: CONTRACT_ERROR_CATALOG.length,
+    };
+  }
+
+  /**
+   * Set or update a delegate for a package
+   * POST /onchain/aid-escrow/packages/:id/delegate
+   */
+  @Post('packages/:id/delegate')
+  @Roles(AppRole.admin, AppRole.operator)
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Set a delegate for a package',
+    description:
+      'Assigns or updates the delegate address for an aid package. The delegate may claim the package on behalf of the recipient. Admin/operator only.',
+  })
+  @ApiOkResponse({
+    description: 'Delegate set successfully.',
+    schema: {
+      example: {
+        packageId: 'pkg_123456789',
+        delegateAddress:
+          'GBUQWP3BOUZX34ULNQG23RQ6F4BFXWBTRSE53XSTE23JMCVOCJGXVSVZ',
+        transactionHash:
+          'ABC123DEF456ABC123DEF456ABC123DEF456ABC123DEF456ABC123DEF456ABCD',
+        timestamp: '2026-03-30T12:30:00.000Z',
+        status: 'success',
+        expiresAt: 1735689600,
+      },
+    },
+  })
+  @ApiBadRequestResponse({ description: 'Invalid input or package not found.' })
+  @ApiNotFoundResponse({ description: 'Package does not exist.' })
+  @ApiInternalServerErrorResponse({
+    description: 'Blockchain transaction failed.',
+  })
+  async setDelegate(
+    @Param('id') packageId: string,
+    @Body() dto: SetDelegateDto,
+    @Req() req: Request & { user?: { address?: string } },
+  ): Promise<any> {
+    try {
+      const adminAddress = req.user?.address || 'admin';
+      return await this.aidEscrowService.setDelegate(
+        packageId,
+        dto,
+        adminAddress,
+      );
+    } catch (error: unknown) {
+      this.logger.error('Failed to set delegate:', error);
+      this.errorMapper.throwMappedError(error);
+    }
+  }
+
+  /**
+   * Revoke the delegate for a package
+   * POST /onchain/aid-escrow/packages/:id/delegate/revoke
+   */
+  @Post('packages/:id/delegate/revoke')
+  @Roles(AppRole.admin, AppRole.operator)
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Revoke the delegate for a package',
+    description:
+      'Removes the delegate address assigned to an aid package. Admin/operator only.',
+  })
+  @ApiOkResponse({
+    description: 'Delegate revoked successfully.',
+    schema: {
+      example: {
+        packageId: 'pkg_123456789',
+        transactionHash:
+          'ABC123DEF456ABC123DEF456ABC123DEF456ABC123DEF456ABC123DEF456ABCD',
+        timestamp: '2026-03-30T12:30:00.000Z',
+        status: 'success',
+      },
+    },
+  })
+  @ApiBadRequestResponse({ description: 'Package not found.' })
+  @ApiNotFoundResponse({ description: 'Package does not exist.' })
+  @ApiInternalServerErrorResponse({
+    description: 'Blockchain transaction failed.',
+  })
+  async revokeDelegate(
+    @Param('id') packageId: string,
+    @Req() req: Request & { user?: { address?: string } },
+  ): Promise<any> {
+    try {
+      const adminAddress = req.user?.address || 'admin';
+      return await this.aidEscrowService.revokeDelegate(
+        packageId,
+        adminAddress,
+      );
+    } catch (error: unknown) {
+      this.logger.error('Failed to revoke delegate:', error);
+      this.errorMapper.throwMappedError(error);
+    }
+  }
+
+  /**
+   * Get the current active delegate for a package
+   * GET /onchain/aid-escrow/packages/:id/delegate
+   */
+  @Get('packages/:id/delegate')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Get the current delegate for a package',
+    description:
+      'Returns the currently active delegate address for an aid package, or empty delegateAddress if none is set or the delegation has expired.',
+  })
+  @ApiOkResponse({
+    description: 'Delegate retrieved successfully.',
+    schema: {
+      example: {
+        packageId: 'pkg_123456789',
+        delegateAddress:
+          'GBUQWP3BOUZX34ULNQG23RQ6F4BFXWBTRSE53XSTE23JMCVOCJGXVSVZ',
+        expiresAt: 1735689600,
+        timestamp: '2026-03-30T12:30:00.000Z',
+      },
+    },
+  })
+  @ApiNotFoundResponse({ description: 'Package does not exist.' })
+  @ApiInternalServerErrorResponse({
+    description: 'Failed to retrieve delegate.',
+  })
+  async getDelegate(@Param('id') packageId: string): Promise<any> {
+    try {
+      return await this.aidEscrowService.getDelegate(packageId);
+    } catch (error: unknown) {
+      this.logger.error('Failed to get delegate:', error);
+      this.errorMapper.throwMappedError(error);
+    }
+  }
+
+  /**
+   * Get the full delegate change history for a package
+   * GET /onchain/aid-escrow/packages/:id/delegate/history
+   */
+  @Get('packages/:id/delegate/history')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Get delegate history for a package',
+    description:
+      'Returns the full audit trail of delegate assignments and revocations for an aid package.',
+  })
+  @ApiOkResponse({
+    description: 'Delegate history retrieved successfully.',
+    schema: {
+      example: {
+        packageId: 'pkg_123456789',
+        history: [
+          {
+            packageId: 'pkg_123456789',
+            previousDelegate: null,
+            newDelegate:
+              'GBUQWP3BOUZX34ULNQG23RQ6F4BFXWBTRSE53XSTE23JMCVOCJGXVSVZ',
+            changedBy:
+              'GBUQWP3BOUZX34ULNQG23RQ6F4BFXWBTRSE53XSTE23JMCVOCJGXVSVZ',
+            changedAt: 1711814400,
+            reason: 'delegate_set',
+          },
+        ],
+        total: 1,
+        timestamp: '2026-03-30T12:30:00.000Z',
+      },
+    },
+  })
+  @ApiNotFoundResponse({ description: 'Package does not exist.' })
+  @ApiInternalServerErrorResponse({
+    description: 'Failed to retrieve delegate history.',
+  })
+  async getDelegateHistory(@Param('id') packageId: string): Promise<any> {
+    try {
+      const result = await this.aidEscrowService.getDelegateHistory(packageId);
+      return { ...result, total: result.history.length };
+    } catch (error: unknown) {
+      this.logger.error('Failed to get delegate history:', error);
       this.errorMapper.throwMappedError(error);
     }
   }

@@ -1,12 +1,11 @@
-import {
-  BadRequestException,
-  ConflictException,
-  ForbiddenException,
-  NotFoundException,
-} from '@nestjs/common';
+import { AppException } from '../common/dto/error-response.dto';
+
 import * as crypto from 'crypto';
 import * as fsPromises from 'fs/promises';
-import { UploadSessionService } from '../evidence/upload-session.service';
+import {
+  MAX_ARTIFACTS_PER_CLAIM,
+  UploadSessionService,
+} from '../evidence/upload-session.service';
 import { UploadSessionStatus } from '@prisma/client';
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -52,8 +51,20 @@ const mockStore = {
   cleanupSession: jest.fn(),
 };
 
-const mockPrisma = {
+const mockTransaction = {
+  $queryRaw: jest.fn(),
   evidenceQueueItem: {
+    count: jest.fn(),
+    create: jest.fn(),
+  },
+};
+
+const mockPrisma = {
+  $transaction: jest.fn((callback: (tx: any) => any) =>
+    callback(mockTransaction),
+  ),
+  evidenceQueueItem: {
+    count: jest.fn(),
     findFirst: jest.fn(),
     create: jest.fn(),
   },
@@ -74,6 +85,7 @@ jest.mock('fs/promises', () => ({
 }));
 
 jest.mock('fs', () => ({
+  ...jest.requireActual('fs'),
   existsSync: jest.fn(() => true),
   mkdirSync: jest.fn(),
 }));
@@ -126,7 +138,7 @@ describe('UploadSessionService', () => {
           },
           'owner-1',
         ),
-      ).rejects.toThrow(BadRequestException);
+      ).rejects.toThrow(AppException);
     });
 
     it('rejects a disallowed mimeType', async () => {
@@ -140,7 +152,7 @@ describe('UploadSessionService', () => {
           },
           'owner-1',
         ),
-      ).rejects.toThrow(BadRequestException);
+      ).rejects.toThrow(AppException);
     });
 
     it('rejects totalSize exceeding MAX_FILE_SIZE', async () => {
@@ -154,7 +166,35 @@ describe('UploadSessionService', () => {
           },
           'owner-1',
         ),
-      ).rejects.toThrow(BadRequestException);
+      ).rejects.toThrow(AppException);
+    });
+
+    it('rejects a disallowed extension even with an allowed mimeType', async () => {
+      await expect(
+        service.create(
+          {
+            fileName: 'evil.exe',
+            mimeType: 'text/plain',
+            totalSize: 10,
+            chunkSize: 10,
+          },
+          'owner-1',
+        ),
+      ).rejects.toThrow(/extension/i);
+    });
+
+    it('rejects an extension/mimeType mismatch (txt declared as pdf)', async () => {
+      await expect(
+        service.create(
+          {
+            fileName: 'note.txt',
+            mimeType: 'application/pdf',
+            totalSize: 10,
+            chunkSize: 10,
+          },
+          'owner-1',
+        ),
+      ).rejects.toThrow(/does not match/i);
     });
   });
 
@@ -212,19 +252,19 @@ describe('UploadSessionService', () => {
 
       await expect(
         service.uploadChunk('sess-1', 0, checksum, chunk, 'owner-1'),
-      ).rejects.toThrow(ConflictException);
+      ).rejects.toThrow(AppException);
     });
 
     it('throws BadRequestException for out-of-range index', async () => {
       await expect(
         service.uploadChunk('sess-1', 99, checksum, chunk, 'owner-1'),
-      ).rejects.toThrow(BadRequestException);
+      ).rejects.toThrow(AppException);
     });
 
     it('throws BadRequestException for checksum mismatch', async () => {
       await expect(
         service.uploadChunk('sess-1', 0, 'badhash', chunk, 'owner-1'),
-      ).rejects.toThrow(BadRequestException);
+      ).rejects.toThrow(AppException);
     });
 
     it('throws BadRequestException for wrong chunk size', async () => {
@@ -232,20 +272,20 @@ describe('UploadSessionService', () => {
       const ws = sha256(wrongSize);
       await expect(
         service.uploadChunk('sess-1', 0, ws, wrongSize, 'owner-1'),
-      ).rejects.toThrow(BadRequestException);
+      ).rejects.toThrow(AppException);
     });
 
     it('throws ForbiddenException when ownerId does not match', async () => {
       await expect(
         service.uploadChunk('sess-1', 0, checksum, chunk, 'other-owner'),
-      ).rejects.toThrow(ForbiddenException);
+      ).rejects.toThrow(AppException);
     });
 
     it('throws NotFoundException for unknown session', async () => {
       mockStore.getSession.mockResolvedValue(null);
       await expect(
         service.uploadChunk('sess-1', 0, checksum, chunk, 'owner-1'),
-      ).rejects.toThrow(NotFoundException);
+      ).rejects.toThrow(AppException);
     });
 
     it('throws BadRequestException for expired session', async () => {
@@ -271,7 +311,14 @@ describe('UploadSessionService', () => {
       mockStore.updateSessionStatus.mockResolvedValue(undefined);
       mockStore.cleanupSession.mockResolvedValue(undefined);
       mockPrisma.evidenceQueueItem.findFirst.mockResolvedValue(null);
+      mockPrisma.evidenceQueueItem.count.mockResolvedValue(0);
       mockPrisma.evidenceQueueItem.create.mockResolvedValue({
+        id: 'ev-1',
+        fileName: 'evidence.txt',
+      });
+      mockTransaction.$queryRaw.mockResolvedValue([{ id: 'claim-1' }]);
+      mockTransaction.evidenceQueueItem.count.mockResolvedValue(0);
+      mockTransaction.evidenceQueueItem.create.mockResolvedValue({
         id: 'ev-1',
         fileName: 'evidence.txt',
       });
@@ -289,6 +336,56 @@ describe('UploadSessionService', () => {
       );
     });
 
+    it('allows associating an artifact when the resulting count is at the limit', async () => {
+      mockPrisma.evidenceQueueItem.count.mockResolvedValue(
+        MAX_ARTIFACTS_PER_CLAIM - 1,
+      );
+      mockTransaction.evidenceQueueItem.count.mockResolvedValue(
+        MAX_ARTIFACTS_PER_CLAIM - 1,
+      );
+
+      await service.finalize('sess-1', 'owner-1', 'claim-1');
+
+      expect(mockTransaction.evidenceQueueItem.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ metadata: { claimId: 'claim-1' } }),
+        }),
+      );
+    });
+
+    it('rejects associating an artifact one over the claim limit', async () => {
+      mockPrisma.evidenceQueueItem.count.mockResolvedValue(
+        MAX_ARTIFACTS_PER_CLAIM,
+      );
+
+      await expect(
+        service.finalize('sess-1', 'owner-1', 'claim-1'),
+      ).rejects.toThrow(
+        `Claim artifact limit of ${MAX_ARTIFACTS_PER_CLAIM} exceeded`,
+      );
+
+      expect(mockPrisma.evidenceQueueItem.create).not.toHaveBeenCalled();
+      expect(mockStore.getAllChunks).not.toHaveBeenCalled();
+    });
+
+    it('rechecks capacity under the claim lock before creating an artifact', async () => {
+      mockPrisma.evidenceQueueItem.count.mockResolvedValue(
+        MAX_ARTIFACTS_PER_CLAIM - 1,
+      );
+      mockTransaction.evidenceQueueItem.count.mockResolvedValue(
+        MAX_ARTIFACTS_PER_CLAIM,
+      );
+
+      await expect(
+        service.finalize('sess-1', 'owner-1', 'claim-1'),
+      ).rejects.toThrow(
+        `Claim artifact limit of ${MAX_ARTIFACTS_PER_CLAIM} exceeded`,
+      );
+
+      expect(mockTransaction.evidenceQueueItem.create).not.toHaveBeenCalled();
+      expect(fsPromises.unlink).toHaveBeenCalled();
+    });
+
     it('throws BadRequestException when chunks are missing', async () => {
       mockStore.getReceivedChunks.mockResolvedValue([0]); // only 1 of 3
       await expect(service.finalize('sess-1', 'owner-1')).rejects.toThrow(
@@ -302,13 +399,62 @@ describe('UploadSessionService', () => {
       });
       (fsPromises.unlink as jest.Mock).mockResolvedValue(undefined);
       await expect(service.finalize('sess-1', 'owner-1')).rejects.toThrow(
-        ConflictException,
+        AppException,
       );
     });
 
     it('cleans up Redis keys after finalization', async () => {
       await service.finalize('sess-1', 'owner-1');
       expect(mockStore.cleanupSession).toHaveBeenCalledWith('sess-1', 3);
+    });
+
+    it('aborts the session and rejects when assembled content does not match the declared mimeType', async () => {
+      mockStore.getSession.mockResolvedValue(
+        makeSession({ fileName: 'evidence.png', mimeType: 'image/png' }),
+      );
+      // Plain bytes, not a real PNG (no PNG magic-byte signature).
+      const fakeChunk = Buffer.alloc(100, 0x61);
+      mockStore.getAllChunks.mockResolvedValue([
+        fakeChunk,
+        fakeChunk,
+        fakeChunk,
+      ]);
+
+      await expect(service.finalize('sess-1', 'owner-1')).rejects.toThrow(
+        /do not match/i,
+      );
+
+      expect(mockStore.updateSessionStatus).toHaveBeenCalledWith(
+        'sess-1',
+        UploadSessionStatus.aborted,
+      );
+      expect(mockStore.cleanupSession).toHaveBeenCalledWith('sess-1', 3);
+      expect(mockPrisma.evidenceQueueItem.create).not.toHaveBeenCalled();
+      expect(fsPromises.writeFile).not.toHaveBeenCalled();
+    });
+
+    it('accepts assembled content whose magic bytes match the declared mimeType', async () => {
+      mockStore.getSession.mockResolvedValue(
+        makeSession({ fileName: 'evidence.png', mimeType: 'image/png' }),
+      );
+      const pngMagic = Buffer.from([
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+      ]);
+      const firstChunk = Buffer.concat([pngMagic, Buffer.alloc(92, 1)]);
+      const otherChunk = Buffer.alloc(100, 1);
+      mockStore.getAllChunks.mockResolvedValue([
+        firstChunk,
+        otherChunk,
+        otherChunk,
+      ]);
+
+      const result = await service.finalize('sess-1', 'owner-1');
+
+      expect(result).toMatchObject({ id: 'ev-1' });
+      expect(mockStore.updateSessionStatus).toHaveBeenCalledWith(
+        'sess-1',
+        UploadSessionStatus.completed,
+      );
     });
   });
 

@@ -7,7 +7,7 @@ import { AppEmptyState } from '@/components/empty-state/AppEmptyState';
 import { EvidenceArtifactViewer } from './EvidenceArtifactViewer';
 import { RedactionControls } from './RedactionControls';
 import { getAppUserRole, getSampleVerificationText, isOperationsRole } from '@/lib/app-role';
-import { startEvidenceVerification, VerificationApiError } from '@/lib/verification-api';
+import { startEvidenceVerification } from '@/lib/verification-api';
 import { useToast } from '@/components/ToastProvider';
 import { normalizeError } from '@/lib/error-utils';
 import type {
@@ -70,7 +70,7 @@ interface EnhancedFlowState {
     apiError: Error | string | null;
     result: VerificationResult | null;
     evidenceArtifact: EvidenceArtifact | null;
-    artifactNotes: string;
+    artifactNotes?: string;
     showArtifactViewer: boolean;
 }
 
@@ -313,7 +313,7 @@ export const EnhancedVerificationFlow: React.FC = () => {
 
                 setFlowState(prev => ({
                     ...prev,
-                    apiError: err as any,
+                    apiError: err instanceof Error ? err : String(err),
                     step: 'upload',
                 }));
                 pendingPayload.current = null;
@@ -322,7 +322,7 @@ export const EnhancedVerificationFlow: React.FC = () => {
         return () => {
             cancelled = true;
         };
-    }, [flowState.step]);
+    }, [flowState.step, toast]);
 
     /* ── Redaction Handlers ───────────────────────────────────────────────── */
 
