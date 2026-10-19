@@ -1,4 +1,4 @@
-﻿import { Injectable, BadRequestException } from '@nestjs/common';
+import { Injectable, BadRequestException } from '@nestjs/common';
 import { createHash } from 'crypto';
 import { Type } from 'class-transformer';
 import { IsInt, IsISO8601, IsOptional, IsString, Max, Min } from 'class-validator';
@@ -119,11 +119,7 @@ export class AuditService {
     }
   }
 
-  async findLogs(query: AuditQuery) {
-    const page = Math.max(1, query.page ?? 1);
-    const limit = Math.min(200, Math.max(1, query.limit ?? 50));
-    const skip = (page - 1) * limit;
-
+  async findLogs(query: AuditQueryDto) {
     const where: Prisma.AuditLogWhereInput = {};
 
     if (query.entity) where.entity = query.entity;
@@ -137,6 +133,25 @@ export class AuditService {
       if (query.endTime) where.timestamp.lte = new Date(query.endTime);
     }
 
+    if (query.cursor) {
+      const parts = query.cursor.split('|');
+      if (parts.length !== 2 || !parts[0] || !parts[1]) {
+        throw new BadRequestException(
+          "Invalid 'cursor': expected '<iso_timestamp>|<id>'",
+        );
+      }
+      const cursorTs = new Date(parts[0]);
+      const cursorId = parts[1];
+      where.OR = [
+        { timestamp: { lt: cursorTs } },
+        { timestamp: cursorTs, id: { lt: cursorId } },
+      ];
+    }
+
+    const limit = Math.min(200, Math.max(1, query.limit ?? 50));
+    const page = query.cursor ? 1 : Math.max(1, query.page ?? 1);
+    const skip = query.cursor ? 0 : (page - 1) * limit;
+
     const end = this.metrics.dbQueryDuration.startTimer({
       operation: 'findMany',
       entity: 'AuditLog',
@@ -145,14 +160,19 @@ export class AuditService {
       const [rows, total] = await this.prisma.$transaction([
         this.prisma.auditLog.findMany({
           where,
-          orderBy: { timestamp: 'desc' },
+          orderBy: [{ timestamp: 'desc' }, { id: 'desc' }],
           skip,
           take: limit,
         }),
         this.prisma.auditLog.count({ where }),
       ]);
       end();
-      return { data: rows, total, page, limit };
+      const last = rows[rows.length - 1];
+      const nextCursor =
+        rows.length === limit && last
+          ? last.timestamp.toISOString() + '|' + last.id
+          : null;
+      return { data: rows, total, page, limit, nextCursor };
     } catch (error) {
       this.metrics.dbErrorsTotal.inc({
         operation: 'findMany',
