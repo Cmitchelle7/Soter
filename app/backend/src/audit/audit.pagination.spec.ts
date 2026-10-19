@@ -1,4 +1,4 @@
-﻿/**
+/**
  * #1378: pagination across a large result set — page mode, cursor mode,
  * and boundary chaining between pages.
  *
@@ -80,7 +80,7 @@ const prismaMock = {
         return filtered.slice(skip ?? 0, (skip ?? 0) + (take ?? 50));
       },
     ),
-    count: jest.fn(async ({ where }: any) => applyWhere(ALL_ROWS, where).length),
+    count: jest.fn(({ where }: any) => applyWhere(ALL_ROWS, where).length),
   },
   $transaction: jest.fn(async (ops: any[]) => Promise.all(ops)),
 };
@@ -108,7 +108,7 @@ describe('AuditService pagination (#1378)', () => {
   it('page mode: walks all 250 rows across 5 pages with no gaps or duplicates', async () => {
     const seen = new Set<string>();
     for (let p = 1; p <= 5; p++) {
-      const r = await svc.findLogs({ page: p, limit: 50 } as AuditQueryDto);
+      const r = await svc.findLogs({ page: p, limit: 50 });
       expect(r.page).toBe(p);
       expect(r.limit).toBe(50);
       expect(r.total).toBe(250);
@@ -126,7 +126,7 @@ describe('AuditService pagination (#1378)', () => {
     let cursor: string | undefined;
     let pages = 0;
     while (true) {
-      const r = await svc.findLogs({ cursor, limit: 50 } as AuditQueryDto);
+      const r = await svc.findLogs({ cursor, limit: 50 });
       pages++;
       expect(pages).toBeLessThanOrEqual(6); // 5 full pages + 1 short final
       seen.push(...r.data.map(x => x.id));
@@ -143,18 +143,18 @@ describe('AuditService pagination (#1378)', () => {
     // a nextCursor. A 6th call must return 0 rows and nextCursor=null.
     let cursor: string | undefined;
     for (let p = 1; p <= 5; p++) {
-      const r = await svc.findLogs({ cursor, limit: 50 } as AuditQueryDto);
+      const r = await svc.findLogs({ cursor, limit: 50 });
       cursor = r.nextCursor ?? undefined;
     }
     expect(cursor).toBeDefined();
-    const last = await svc.findLogs({ cursor, limit: 50 } as AuditQueryDto);
+    const last = await svc.findLogs({ cursor, limit: 50 });
     expect(last.data).toHaveLength(0);
     expect(last.nextCursor).toBeNull();
   });
 
   it('rejects malformed cursor with BadRequestException', async () => {
     await expect(
-      svc.findLogs({ cursor: 'not-a-cursor' } as AuditQueryDto),
+      svc.findLogs({ cursor: 'not-a-cursor' }),
     ).rejects.toBeInstanceOf(BadRequestException);
   });
 
