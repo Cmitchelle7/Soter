@@ -70,7 +70,7 @@ function applyWhere(rows: Row[], where: any): Row[] {
 const prismaMock = {
   auditLog: {
     findMany: jest.fn(
-      async ({ where, orderBy, skip, take }: any) => {
+      ({ where, skip, take }: any) => {
         const filtered = applyWhere(ALL_ROWS, where);
         filtered.sort((a, b) => {
           const t = b.timestamp.getTime() - a.timestamp.getTime();
@@ -82,7 +82,7 @@ const prismaMock = {
     ),
     count: jest.fn(({ where }: any) => applyWhere(ALL_ROWS, where).length),
   },
-  $transaction: jest.fn(async (ops: any[]) => Promise.all(ops)),
+  $transaction: jest.fn((ops: any[]) => Promise.all(ops)),
 };
 
 const metricsMock = {
