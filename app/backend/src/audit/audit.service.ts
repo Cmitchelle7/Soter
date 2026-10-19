@@ -2,7 +2,14 @@ import { AppException, ERROR_CODES } from '../common/dto/error-response.dto';
 import { Injectable } from '@nestjs/common';
 import { createHash } from 'crypto';
 import { Type } from 'class-transformer';
-import { IsInt, IsISO8601, IsOptional, IsString, Max, Min } from 'class-validator';
+import {
+  IsInt,
+  IsISO8601,
+  IsOptional,
+  IsString,
+  Max,
+  Min,
+} from 'class-validator';
 import { PrismaService } from '../prisma/prisma.service';
 import { Prisma } from '@prisma/client';
 import { MetricsService } from 'src/audit/metrics.service';
@@ -17,31 +24,45 @@ export interface AuditLogParams {
 }
 
 export class AuditQueryDto {
-  @IsOptional() @IsString()
+  @IsOptional()
+  @IsString()
   entity?: string;
 
-  @IsOptional() @IsString()
+  @IsOptional()
+  @IsString()
   entityId?: string;
 
-  @IsOptional() @IsString()
+  @IsOptional()
+  @IsString()
   actorId?: string;
 
-  @IsOptional() @IsString()
+  @IsOptional()
+  @IsString()
   action?: string;
 
-  @IsOptional() @IsISO8601()
+  @IsOptional()
+  @IsISO8601()
   startTime?: string;
 
-  @IsOptional() @IsISO8601()
+  @IsOptional()
+  @IsISO8601()
   endTime?: string;
 
-  @IsOptional() @Type(() => Number) @IsInt() @Min(1)
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
   page?: number;
 
-  @IsOptional() @Type(() => Number) @IsInt() @Min(1) @Max(200)
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(200)
   limit?: number;
 
-  @IsOptional() @IsString()
+  @IsOptional()
+  @IsString()
   cursor?: string;
 }
 
@@ -272,6 +293,3 @@ export class AuditService {
     return [header, ...lines].join('\r\n');
   }
 }
-
-
-
