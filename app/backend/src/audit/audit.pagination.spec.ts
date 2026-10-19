@@ -50,8 +50,10 @@ function applyWhere(rows: Row[], where: any): Row[] {
   if (where?.actorId) out = out.filter(r => r.actorId === where.actorId);
   if (where?.action) out = out.filter(r => r.action === where.action);
   if (where?.timestamp) {
-    if (where.timestamp.gte) out = out.filter(r => r.timestamp >= where.timestamp.gte);
-    if (where.timestamp.lte) out = out.filter(r => r.timestamp <= where.timestamp.lte);
+    if (where.timestamp.gte)
+      out = out.filter(r => r.timestamp >= where.timestamp.gte);
+    if (where.timestamp.lte)
+      out = out.filter(r => r.timestamp <= where.timestamp.lte);
   }
   if (where?.OR) {
     // Cursor predicate: (timestamp < ts) OR (timestamp == ts AND id < id)
@@ -69,17 +71,15 @@ function applyWhere(rows: Row[], where: any): Row[] {
 
 const prismaMock = {
   auditLog: {
-    findMany: jest.fn(
-      ({ where, skip, take }: any) => {
-        const filtered = applyWhere(ALL_ROWS, where);
-        filtered.sort((a, b) => {
-          const t = b.timestamp.getTime() - a.timestamp.getTime();
-          if (t !== 0) return t;
-          return b.id.localeCompare(a.id);
-        });
-        return filtered.slice(skip ?? 0, (skip ?? 0) + (take ?? 50));
-      },
-    ),
+    findMany: jest.fn(({ where, skip, take }: any) => {
+      const filtered = applyWhere(ALL_ROWS, where);
+      filtered.sort((a, b) => {
+        const t = b.timestamp.getTime() - a.timestamp.getTime();
+        if (t !== 0) return t;
+        return b.id.localeCompare(a.id);
+      });
+      return filtered.slice(skip ?? 0, (skip ?? 0) + (take ?? 50));
+    }),
     count: jest.fn(({ where }: any) => applyWhere(ALL_ROWS, where).length),
   },
   $transaction: jest.fn((ops: any[]) => Promise.all(ops)),
