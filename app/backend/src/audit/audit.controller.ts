@@ -1,6 +1,6 @@
 import { Controller, Get, Query, Res, Version } from '@nestjs/common';
 import { Response } from 'express';
-import { AuditService, AuditQuery, ExportAuditQuery } from './audit.service';
+import { AuditService, AuditQueryDto, ExportAuditQuery } from './audit.service';
 import {
   ApiTags,
   ApiOperation,
@@ -48,7 +48,7 @@ export class AuditController {
     description: 'Items per page (default: 50, max: 200)',
   })
   async getLogs(
-    @Query() query: AuditQuery,
+    @Query() query: AuditQueryDto,
     @Res({ passthrough: true }) res: Response,
   ) {
     const result = await this.auditService.findLogs(query);
@@ -56,6 +56,8 @@ export class AuditController {
     res.setHeader('X-Total-Count', String(result.total));
     res.setHeader('X-Page', String(result.page));
     res.setHeader('X-Limit', String(result.limit));
+
+    if (result.nextCursor) res.setHeader('X-Next-Cursor', result.nextCursor);
 
     return result.data;
   }
