@@ -1,7 +1,7 @@
-import { Injectable, BadRequestException } from '@nestjs/common';
+﻿import { Injectable, BadRequestException } from '@nestjs/common';
 import { createHash } from 'crypto';
 import { Type } from 'class-transformer';
-import { IsInt, IsOptional, Max, Min } from 'class-validator';
+import { IsInt, IsISO8601, IsOptional, IsString, Max, Min } from 'class-validator';
 import { PrismaService } from '../prisma/prisma.service';
 import { Prisma } from '@prisma/client';
 import { MetricsService } from 'src/audit/metrics.service';
@@ -14,15 +14,33 @@ export interface AuditLogParams {
   metadata?: Record<string, any>;
 }
 
-export interface AuditQuery {
+export class AuditQueryDto {
+  @IsOptional() @IsString()
   entity?: string;
+
+  @IsOptional() @IsString()
   entityId?: string;
+
+  @IsOptional() @IsString()
   actorId?: string;
+
+  @IsOptional() @IsString()
   action?: string;
+
+  @IsOptional() @IsISO8601()
   startTime?: string;
+
+  @IsOptional() @IsISO8601()
   endTime?: string;
+
+  @IsOptional() @Type(() => Number) @IsInt() @Min(1)
   page?: number;
+
+  @IsOptional() @Type(() => Number) @IsInt() @Min(1) @Max(200)
   limit?: number;
+
+  @IsOptional() @IsString()
+  cursor?: string;
 }
 
 export class ExportAuditQuery {
@@ -227,3 +245,6 @@ export class AuditService {
     return [header, ...lines].join('\r\n');
   }
 }
+
+
+
